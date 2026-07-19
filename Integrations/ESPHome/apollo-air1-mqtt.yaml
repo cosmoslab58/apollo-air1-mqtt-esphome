@@ -1,0 +1,631 @@
+# Apollo AIR-1 — MQTT-only firmware (no Home Assistant)
+#
+# Forked from the official ApolloAutomation/AIR-1 ESPHome config:
+#   https://github.com/ApolloAutomation/AIR-1/blob/main/Integrations/ESPHome/Core.yaml
+# (ESP32-C3, i2c pins, sensor platforms, deep-sleep timing, and RGB status logic
+# are taken directly from that source.)
+#
+# Changes from upstream:
+#   - `api:` (Home Assistant native API) removed entirely, replaced with `mqtt:`.
+#   - The "OTA Mode" binary_sensor (which mirrored a Home Assistant input_boolean
+#     over the API) is gone. Its job — keep the device awake instead of deep-sleeping
+#     — is now done by the existing `prevent_sleep` switch alone, which you can
+#     trigger via a long (3s) button press or by publishing to its MQTT command
+#     topic. See apollo-air1-mqtt-README.md for the OTA procedure.
+#   - `reportAllValues` now also publishes one combined JSON snapshot to
+#     `${mqtt_topic}/state` so Node-RED/InfluxDB can ingest a single message per
+#     wake cycle instead of joining ~20 separate per-entity topics.
+#   - `statusCheck` (the boot LED color) now reflects MQTT broker connectivity
+#     instead of Home Assistant API connectivity.
+
+substitutions:
+  name: apollo-air-1
+  friendly_name: "Apollo AIR-1"
+  version: "1.0.0-mqtt"
+  mqtt_topic: apollo-air1
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  comment: "Apollo AIR-1 (MQTT firmware, CO2 add-on installed)"
+  name_add_mac_suffix: true
+  project:
+    name: "custom.apollo-air-1-mqtt"
+    version: "${version}"
+  min_version: 2025.2.0
+  on_boot:
+    priority: 500
+    then:
+      - text_sensor.template.publish:
+          id: apollo_firmware_version
+          state: "${version}"
+      - lambda: |-
+          id(deep_sleep_1).set_sleep_duration(id(deep_sleep_sleep_duration).state * 60 * 1000);
+      - if:
+          condition:
+            switch.is_on: prevent_sleep
+          then:
+            - lambda: |-
+                ESP_LOGW("Apollo", "Preventing deep sleep: prevent_sleep switch is on");
+                id(deep_sleep_1).prevent_deep_sleep();
+  on_shutdown:
+    - light.turn_off: rgb_light
+
+esp32:
+  variant: esp32c3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Apollo AIR1 Hotspot"
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  port: 1883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  topic_prefix: ${mqtt_topic}
+  discovery: false
+  on_connect:
+    - delay: 20s
+    - lambda: |-
+        id(reportAllValues).execute();
+    - delay: 3s
+    - if:
+        condition:
+          switch.is_off: prevent_sleep
+        then:
+          - deep_sleep.enter:
+              id: deep_sleep_1
+
+globals:
+  - id: cycleCounter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: button_press_timestamp
+    restore_value: no
+    type: uint32_t
+    initial_value: '0'
+  - id: runTest
+    restore_value: yes
+    type: bool
+    initial_value: "true"
+  - id: testCycleCount
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: dps310Passed
+    restore_value: no
+    type: bool
+    initial_value: "false"
+
+i2c:
+  sda: GPIO1
+  scl: GPIO0
+  id: bus_a
+
+deep_sleep:
+  id: deep_sleep_1
+  sleep_duration: 5min
+  run_duration: 2min
+
+number:
+  - platform: template
+    name: "SEN55 Temperature Offset"
+    id: sen55_temperature_offset
+    restore_value: true
+    initial_value: 6.0
+    min_value: -70.0
+    max_value: 70.0
+    entity_category: "CONFIG"
+    unit_of_measurement: "°C"
+    optimistic: true
+    update_interval: never
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "SEN55 Humidity Offset"
+    id: sen55_humidity_offset
+    restore_value: true
+    initial_value: 0
+    min_value: -70.0
+    max_value: 70.0
+    entity_category: "CONFIG"
+    unit_of_measurement: "%"
+    optimistic: true
+    update_interval: never
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "DPS310 Pressure Offset"
+    id: dps310_pressure_offset
+    disabled_by_default: true
+    restore_value: true
+    initial_value: 0.0
+    min_value: -100.0
+    max_value: 100.0
+    entity_category: "CONFIG"
+    unit_of_measurement: "hPa"
+    optimistic: true
+    update_interval: never
+    step: 0.1
+    mode: box
+  - platform: template
+    name: "Sleep Duration"
+    id: deep_sleep_sleep_duration
+    min_value: 0
+    max_value: 800
+    step: 1
+    mode: box
+    update_interval: never
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    icon: "mdi:arrow-collapse-right"
+    entity_category: CONFIG
+    unit_of_measurement: "min"
+    on_value:
+      then:
+        - lambda: |-
+            id(deep_sleep_1).set_sleep_duration(x * 60 * 1000);
+
+binary_sensor:
+  - platform: status
+    name: "Device Online"
+    id: device_online
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+      ignore_strapping_warning: true
+    id: reset_button
+    on_press:
+      then:
+        - lambda: |-
+            id(button_press_timestamp) = millis();
+    on_release:
+      then:
+        - lambda: |-
+            if (millis() - id(button_press_timestamp) >= 10000) {
+              id(prevent_sleep).turn_on();
+              id(factory_reset_switch).turn_on();
+            }
+            else if (millis() - id(button_press_timestamp) >= 3000) {
+              // Hold 3s: keep device awake (e.g. for OTA)
+              id(prevent_sleep).turn_on();
+              id(deep_sleep_1).prevent_deep_sleep();
+            }
+            else {
+              id(statusCheck).execute();
+              delay(3000);
+              id(testCycleCount) = 0;
+              id(runTest) = true;
+              id(testScript).execute();
+            }
+
+sensor:
+  - platform: internal_temperature
+    name: "ESP Temperature"
+    id: sys_esp_temperature
+
+  - platform: uptime
+    name: "Uptime"
+    id: sys_uptime
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "RSSI"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: scd4x
+    id: scd40
+    co2:
+      name: "CO2"
+      id: "co2"
+    automatic_self_calibration: false
+    update_interval: 60s
+    measurement_mode: "periodic"
+    i2c_id: bus_a
+    ambient_pressure_compensation_source: dps310pressure
+
+  - platform: dps310
+    id: dps_310
+    pressure:
+      name: "DPS310 Pressure"
+      id: dps310pressure
+      filters:
+        - lambda: |-
+            float offset = id(dps310_pressure_offset).state;
+            return isnan(offset) ? x : x + offset;
+    temperature:
+      id: dps310temperature
+    update_interval: 30s
+    i2c_id: bus_a
+
+  - platform: sen5x
+    id: sen55
+    pm_1_0:
+      name: "PM <1µm Weight concentration"
+      id: pm_1_0
+      accuracy_decimals: 1
+    pm_2_5:
+      name: "PM <2.5µm Weight concentration"
+      id: pm_2_5
+      accuracy_decimals: 1
+    pm_4_0:
+      name: "PM <4µm Weight concentration"
+      id: pm_4_0
+      accuracy_decimals: 1
+    pm_10_0:
+      name: "PM <10µm Weight concentration"
+      id: pm_10_0
+      accuracy_decimals: 1
+    temperature:
+      name: "SEN55 Temperature"
+      id: sen55_temperature
+      filters:
+        - lambda: return x - id(sen55_temperature_offset).state;
+      accuracy_decimals: 1
+    humidity:
+      name: "SEN55 Humidity"
+      id: sen55_humidity
+      filters:
+        - lambda: return x - id(sen55_humidity_offset).state;
+      accuracy_decimals: 1
+    voc:
+      name: "SEN55 VOC"
+      id: sen55_voc
+      algorithm_tuning:
+        # https://sensirion.com/media/documents/25AB572C/62B463AA/Sensirion_Engineering_Guidelines_SEN5x.pdf
+        index_offset: 100
+        learning_time_offset_hours: 72
+        learning_time_gain_hours: 72
+        gating_max_duration_minutes: 180
+        std_initial: 50
+        gain_factor: 230
+    nox:
+      name: "SEN55 NOX"
+      id: sen55_nox
+    acceleration_mode: low
+    store_baseline: true
+    address: 0x69
+    update_interval: 10s
+
+  - platform: template
+    name: "PM 0.3 To 1 µm"
+    id: pm0_3_to_1
+    disabled_by_default: true
+    lambda: return id(pm_1_0).state;
+    unit_of_measurement: "µg/m³"
+    state_class: measurement
+    icon: mdi:air-filter
+    update_interval: 10s
+
+  - platform: template
+    name: "PM 1 To 2.5 µm"
+    id: pm1_to_2_5
+    disabled_by_default: true
+    lambda: return std::max(0.0f, id(pm_2_5).state - id(pm_1_0).state);
+    unit_of_measurement: "µg/m³"
+    state_class: measurement
+    icon: mdi:air-filter
+    update_interval: 10s
+
+  - platform: template
+    name: "PM 2.5 To 4 µm"
+    id: pm2_5_to_4
+    disabled_by_default: true
+    lambda: return std::max(0.0f, id(pm_4_0).state - id(pm_2_5).state);
+    unit_of_measurement: "µg/m³"
+    state_class: measurement
+    icon: mdi:air-filter
+    update_interval: 10s
+
+  - platform: template
+    name: "PM 4 To 10 µm"
+    id: pm4_to_10
+    disabled_by_default: true
+    lambda: return std::max(0.0f, id(pm_10_0).state - id(pm_4_0).state);
+    unit_of_measurement: "µg/m³"
+    state_class: measurement
+    icon: mdi:air-filter
+    update_interval: 10s
+
+  - platform: aqi
+    name: "NowCast AQI"
+    id: nowcast_aqi
+    pm_2_5: pm_2_5
+    pm_10_0: pm_10_0
+    calculation_type: AQI
+    device_class: aqi
+
+  - platform: mics_4514
+    id: mics4514
+    nitrogen_dioxide:
+      name: "Nitrogen Dioxide"
+      id: nitrogen_dioxide
+    carbon_monoxide:
+      name: "Carbon Monoxide"
+      id: carbon_monoxide
+    hydrogen:
+      name: "Hydrogen"
+      id: hydrogen
+    ethanol:
+      name: "Ethanol"
+      id: ethanol
+    methane:
+      name: "Methane"
+      id: methane
+    ammonia:
+      name: "Ammonia"
+      id: ammonia
+    update_interval: 60s
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: rgb_light
+    name: "RGB Light"
+    pin: GPIO3
+    default_transition_length: 0s
+    chipset: WS2812
+    num_leds: 3
+    rgb_order: grb
+    effects:
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 250ms
+          update_interval: 250ms
+          min_brightness: 50%
+          max_brightness: 100%
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 100ms
+          update_interval: 100ms
+          min_brightness: 50%
+          max_brightness: 100%
+
+button:
+  - platform: restart
+    icon: mdi:power-cycle
+    name: "ESP Reboot"
+
+  - platform: factory_reset
+    disabled_by_default: true
+    name: "Factory Reset ESP"
+    id: factory_reset_all
+
+  - platform: template
+    name: "Calibrate SCD40 To 420ppm"
+    id: set_SCD40_calibrate
+    on_press:
+      - scd4x.perform_forced_calibration:
+          value: 420
+          id: scd40
+
+  - platform: template
+    name: "Clean SEN55"
+    id: clean_sen55
+    on_press:
+      - sen5x.start_fan_autoclean: sen55
+
+text_sensor:
+  # Convert VOC Index To Text:
+  # https://sensirion.com/media/documents/02232963/6294E043/Info_Note_VOC_Index.pdf
+  - platform: template
+    name: "VOC Quality"
+    id: voc_quality
+    icon: mdi:air-filter
+    lambda: |-
+      if (id(sen55_voc).state < 80) {
+        return std::string("Improved");}
+      else if (id(sen55_voc).state < 150) {
+        return std::string("Normal");}
+      else if (id(sen55_voc).state < 250) {
+        return std::string("Abnormal");}
+      else if (id(sen55_voc).state < 400) {
+        return std::string("Very abnormal");}
+      else if (id(sen55_voc).state >= 400) {
+        return std::string("Extremely abnormal");}
+      else {
+        return std::string("Unknown");}
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: wifi_ip
+      entity_category: "diagnostic"
+  - platform: version
+    name: "ESPHome Version"
+    hide_timestamp: true
+    entity_category: "diagnostic"
+  - platform: template
+    name: "Apollo Firmware Version"
+    id: apollo_firmware_version
+    update_interval: never
+    entity_category: "diagnostic"
+
+switch:
+  - platform: factory_reset
+    id: factory_reset_switch
+    internal: true
+
+  - platform: template
+    name: "Prevent Sleep"
+    id: prevent_sleep
+    icon: mdi:sleep
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    entity_category: "config"
+    on_turn_on:
+      then:
+        - lambda: |-
+            id(deep_sleep_1).prevent_deep_sleep();
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(deep_sleep_1).allow_deep_sleep();
+
+script:
+  - id: testScript
+    then:
+      if:
+        condition:
+          - lambda: "return id(runTest) == true;"
+        then:
+          - lambda: "id(runTest) = false;"
+          - lambda: "id(testCycleCount) = 0;"
+          - while:
+              condition:
+                - lambda: "return id(testCycleCount) < 5;"
+              then:
+                - if:
+                    condition:
+                      - lambda: "return id(dps310Passed) == false;"
+                    then:
+                      - if:
+                          condition:
+                            - lambda: "return id(dps310pressure).state > 800 && id(dps310pressure).state < 1200;"
+                          then:
+                            - lambda: "id(dps310Passed) = true;"
+                - if:
+                    condition:
+                      - lambda: "return id(dps310Passed);"
+                    then:
+                      - lambda: "id(testCycleCount) = 10;"
+                - lambda: "id(runTest) = false;"
+                - delay: 1s
+                - lambda: "id(testCycleCount) += 1;"
+          - if:
+              condition:
+                - lambda: "return id(dps310Passed);"
+              then:
+                - lambda: "id(runTest) = false;"
+                - light.turn_on:
+                    id: rgb_light
+                    red: 0%
+                    green: 100%
+                    blue: 0%
+                - delay: 5s
+                - light.turn_on:
+                    id: rgb_light
+                    red: 0%
+                    green: 0%
+                    blue: 0%
+                - light.turn_off:
+                    id: rgb_light
+              else:
+                - lambda: "id(runTest) = false;"
+                - light.turn_on:
+                    id: rgb_light
+                    red: 100%
+                    green: 0%
+                    blue: 0%
+                - delay: 5s
+                - light.turn_on:
+                    id: rgb_light
+                    red: 0%
+                    green: 0%
+                    blue: 0%
+                - light.turn_off:
+                    id: rgb_light
+
+  - id: statusCheck
+    then:
+      - if:
+          condition:
+            lambda: "return id(mqtt_client).is_connected();"
+          then:
+            - logger.log: "Apollo Automation: Connected to MQTT broker"
+            - light.turn_on:
+                id: rgb_light
+                brightness: 100%
+                red: 0%
+                green: 0%
+                blue: 100%
+          else:
+            - if:
+                condition:
+                  - wifi.connected
+                then:
+                  - logger.log: "Apollo Automation: Connected to WiFi, MQTT broker unreachable"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 100%
+                      red: 0%
+                      green: 100%
+                      blue: 0%
+                else:
+                  - logger.log: "Apollo Automation: Not connected to WiFi"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 100%
+                      red: 100%
+                      green: 100%
+                      blue: 0%
+      - delay: 5s
+      - light.turn_off: rgb_light
+
+  - id: reportAllValues
+    then:
+      - component.update: sen55
+      - component.update: mics4514
+      - component.update: dps_310
+      - component.update: scd40
+      - component.update: wifi_signal_db
+      - component.update: sys_esp_temperature
+      - component.update: sys_uptime
+      - component.update: pm0_3_to_1
+      - component.update: pm1_to_2_5
+      - component.update: pm2_5_to_4
+      - component.update: pm4_to_10
+      - component.update: voc_quality
+      - delay: 500ms
+      - mqtt.publish_json:
+          topic: ${mqtt_topic}/state
+          payload: |-
+            root["co2_ppm"] = id(co2).state;
+            root["pressure_hpa"] = id(dps310pressure).state;
+            root["temperature_c"] = id(sen55_temperature).state;
+            root["humidity_pct"] = id(sen55_humidity).state;
+            root["pm1_0_ugm3"] = id(pm_1_0).state;
+            root["pm2_5_ugm3"] = id(pm_2_5).state;
+            root["pm4_0_ugm3"] = id(pm_4_0).state;
+            root["pm10_0_ugm3"] = id(pm_10_0).state;
+            root["voc_index"] = id(sen55_voc).state;
+            root["nox_index"] = id(sen55_nox).state;
+            root["voc_quality"] = id(voc_quality).state;
+            root["aqi"] = id(nowcast_aqi).state;
+            root["nitrogen_dioxide_ppm"] = id(nitrogen_dioxide).state;
+            root["carbon_monoxide_ppm"] = id(carbon_monoxide).state;
+            root["hydrogen_ppm"] = id(hydrogen).state;
+            root["ethanol_ppm"] = id(ethanol).state;
+            root["methane_ppm"] = id(methane).state;
+            root["ammonia_ppm"] = id(ammonia).state;
+            root["wifi_rssi_db"] = id(wifi_signal_db).state;
+            root["esp_temperature_c"] = id(sys_esp_temperature).state;
+            root["uptime_s"] = id(sys_uptime).state;
+            root["firmware_version"] = "${version}";
