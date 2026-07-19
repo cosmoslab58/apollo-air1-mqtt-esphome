@@ -22,7 +22,7 @@ substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
   version: "1.0.0-mqtt"
-  mqtt_topic: apollo-air1
+  mqtt_topic: cosmos-lab/smarthome/air1
 
 esphome:
   name: "${name}"

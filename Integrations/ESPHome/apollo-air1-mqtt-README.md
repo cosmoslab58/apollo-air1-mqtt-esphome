@@ -36,7 +36,7 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
 
 ## MQTT
 
-- Combined snapshot (what Node-RED subscribes to): **`apollo-air1/state`**,
+- Combined snapshot (what Node-RED subscribes to): **`cosmos-lab/smarthome/air1/state`**,
   one retained-off JSON message per wake cycle:
 
   ```json
@@ -67,11 +67,11 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
   ```
 
 - ESPHome's `mqtt:` component also auto-publishes every entity individually
-  under `apollo-air1/<component>/<object_id>/state` (e.g.
-  `apollo-air1/sensor/co2/state`), and command topics for the switches/buttons
-  (e.g. `apollo-air1/switch/prevent_sleep/command`). Useful for debugging with
-  `mosquitto_sub -t 'apollo-air1/#' -v`; not needed for the normal data path.
-- Availability: `apollo-air1/status` gets `online`/`offline` (MQTT birth/LWT).
+  under `cosmos-lab/smarthome/air1/<component>/<object_id>/state` (e.g.
+  `cosmos-lab/smarthome/air1/sensor/co2/state`), and command topics for the switches/buttons
+  (e.g. `cosmos-lab/smarthome/air1/switch/prevent_sleep/command`). Useful for debugging with
+  `mosquitto_sub -t 'cosmos-lab/smarthome/air1/#' -v`; not needed for the normal data path.
+- Availability: `cosmos-lab/smarthome/air1/status` gets `online`/`offline` (MQTT birth/LWT).
 
 ## Flashing
 
@@ -88,14 +88,14 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
    the button for 3s (turns the `Prevent Sleep` switch on, which also stops
    the deep-sleep timer) so it doesn't go back to sleep mid-flash. Turn
    `Prevent Sleep` back off afterwards (via the web UI at the device's IP, or
-   by publishing to `apollo-air1/switch/prevent_sleep/command`) to resume the
+   by publishing to `cosmos-lab/smarthome/air1/switch/prevent_sleep/command`) to resume the
    normal duty cycle.
 
 ## CO2 calibration
 
 The SCD40 needs periodic forced calibration for accurate absolute readings.
 The `Calibrate SCD40 To 420ppm` button (device web UI, or publish any payload
-to `apollo-air1/button/set_scd40_calibrate/command`) performs a forced
+to `cosmos-lab/smarthome/air1/button/set_scd40_calibrate/command`) performs a forced
 calibration assuming the sensor is currently in fresh outdoor air (~420ppm) —
 run it outdoors, or in a well-ventilated room after a few minutes of
 air exchange.
