@@ -79,8 +79,10 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
 
 1. `cp apollo-air1-mqtt.secrets.yaml.example secrets.yaml` (in this directory)
    and fill in your WiFi SSID/password, an OTA password, and mosquitto
-   host/username/password (broker is `192.168.4.113`, the `iot` stack on
-   `bodhi`).
+   host/username/password. The broker is `mqtt.cosmoslab.dev:8883` over TLS
+   (the `iot` stack on `bodhi`, same endpoint the chassis firmware uses); the
+   firmware embeds the Let's Encrypt root CA (ISRG Root X1) to verify it, and
+   the port (8883) is set in `apollo-air1-mqtt.yaml`, not the secrets file.
 2. First flash over USB:
    ```
    esphome run apollo-air1-mqtt.yaml
