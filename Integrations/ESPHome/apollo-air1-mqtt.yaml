@@ -21,11 +21,16 @@
 #     this unit does not have that optional add-on, so the component would only
 #     fail its I2C init and publish null gas fields. The CO2 add-on (SCD40) is
 #     installed and kept.
+#   - Continuous-mode data: a 60s `interval:` re-publishes the combined
+#     `${mqtt_topic}/state` snapshot whenever `prevent_sleep` is on (the
+#     default). On USB power the device stays awake and streams one point per
+#     minute; on battery (prevent_sleep off) it reverts to one publish per
+#     deep-sleep wake. See apollo-air1-mqtt-README.md.
 
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.0.0-mqtt"
+  version: "1.1.0-mqtt"
   mqtt_topic: cosmos-lab/smarthome/air1
 
 esphome:
@@ -131,6 +136,21 @@ deep_sleep:
   id: deep_sleep_1
   sleep_duration: 5min
   run_duration: 2min
+
+# Continuous (USB) mode: while prevent_sleep is on, re-publish the combined
+# /state snapshot every 60s so Node-RED/InfluxDB keep getting data. The
+# switch.is_on check is only read here as a "running continuously?" flag --
+# it does NOT re-prevent sleep (that latches once when the switch turns on).
+# In battery/duty-cycle mode (prevent_sleep off) this stays quiet and the
+# on_connect publish + deep sleep handles the one-point-per-wake cadence.
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            switch.is_on: prevent_sleep
+          then:
+            - script.execute: reportAllValues
 
 number:
   - platform: template

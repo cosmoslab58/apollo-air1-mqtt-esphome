@@ -20,6 +20,14 @@ Apollo AIR-1  --MQTT-->  mosquitto (bodhi)  --MQTT-->  Node-RED  --Flux write-->
   sensors, publishes over MQTT, sleeps for 5 minutes (configurable via the
   "Sleep Duration" number entity), repeat. A 2-minute run-duration failsafe
   forces sleep even if MQTT never connects.
+- **Continuous (USB) mode:** `prevent_sleep` defaults on, so a freshly flashed
+  unit on USB power never deep-sleeps, and a 60s `interval:` re-publishes the
+  combined `${mqtt_topic}/state` snapshot every minute — InfluxDB/the dashboard
+  get one point per minute. This is the recommended mode for a plugged-in
+  monitor (the SEN55 VOC/NOx gas-index algorithm needs continuous runtime to
+  learn its baseline). Turn `prevent_sleep` off (dashboard Sleep toggle, the
+  device's web UI, or its MQTT command topic) to fall back to the battery/
+  duty-cycle behavior above (one publish per 5-minute wake).
 
 ## Relationship to upstream
 
