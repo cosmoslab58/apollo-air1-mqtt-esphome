@@ -17,6 +17,10 @@
 #     wake cycle instead of joining ~20 separate per-entity topics.
 #   - `statusCheck` (the boot LED color) now reflects MQTT broker connectivity
 #     instead of Home Assistant API connectivity.
+#   - The MICS-4514 gas sensor (NO2/CO/H2/ethanol/methane/ammonia) is removed:
+#     this unit does not have that optional add-on, so the component would only
+#     fail its I2C init and publish null gas fields. The CO2 add-on (SCD40) is
+#     installed and kept.
 
 substitutions:
   name: apollo-air-1
@@ -363,28 +367,6 @@ sensor:
     calculation_type: AQI
     device_class: aqi
 
-  - platform: mics_4514
-    id: mics4514
-    nitrogen_dioxide:
-      name: "Nitrogen Dioxide"
-      id: nitrogen_dioxide
-    carbon_monoxide:
-      name: "Carbon Monoxide"
-      id: carbon_monoxide
-    hydrogen:
-      name: "Hydrogen"
-      id: hydrogen
-    ethanol:
-      name: "Ethanol"
-      id: ethanol
-    methane:
-      name: "Methane"
-      id: methane
-    ammonia:
-      name: "Ammonia"
-      id: ammonia
-    update_interval: 60s
-
 light:
   - platform: esp32_rmt_led_strip
     id: rgb_light
@@ -592,7 +574,6 @@ script:
   - id: reportAllValues
     then:
       - component.update: sen55
-      - component.update: mics4514
       - component.update: dps_310
       - component.update: scd40
       - component.update: wifi_signal_db
@@ -619,12 +600,6 @@ script:
             root["nox_index"] = id(sen55_nox).state;
             root["voc_quality"] = id(voc_quality).state;
             root["aqi"] = id(nowcast_aqi).state;
-            root["nitrogen_dioxide_ppm"] = id(nitrogen_dioxide).state;
-            root["carbon_monoxide_ppm"] = id(carbon_monoxide).state;
-            root["hydrogen_ppm"] = id(hydrogen).state;
-            root["ethanol_ppm"] = id(ethanol).state;
-            root["methane_ppm"] = id(methane).state;
-            root["ammonia_ppm"] = id(ammonia).state;
             root["wifi_rssi_db"] = id(wifi_signal_db).state;
             root["esp_temperature_c"] = id(sys_esp_temperature).state;
             root["uptime_s"] = id(sys_uptime).state;

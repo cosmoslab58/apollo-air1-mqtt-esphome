@@ -13,9 +13,9 @@ Apollo AIR-1  --MQTT-->  mosquitto (bodhi)  --MQTT-->  Node-RED  --Flux write-->
 ## Hardware
 
 - ESP32-C3, SEN55 (PM1/2.5/4/10, VOC index, NOx index, temperature, humidity),
-  DPS310 (pressure), MICS-4514 (NO2, CO, H2, ethanol, methane, ammonia),
-  SCD40 (CO2 — optional add-on, installed on this unit), WS2812 RGB status LED,
-  physical button.
+  DPS310 (pressure), SCD40 (CO2 — optional add-on, installed on this unit),
+  WS2812 RGB status LED, physical button. (The optional MICS-4514 gas sensor
+  is not installed on this unit, so it is left out of the firmware.)
 - Battery/USB powered, runs on a deep-sleep duty cycle: wakes, reads all
   sensors, publishes over MQTT, sleeps for 5 minutes (configurable via the
   "Sleep Duration" number entity), repeat. A 2-minute run-duration failsafe
@@ -53,12 +53,6 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
     "nox_index": 1,
     "voc_quality": "Normal",
     "aqi": 12,
-    "nitrogen_dioxide_ppm": 0.01,
-    "carbon_monoxide_ppm": 0.2,
-    "hydrogen_ppm": 0.0,
-    "ethanol_ppm": 0.0,
-    "methane_ppm": 0.0,
-    "ammonia_ppm": 0.0,
     "wifi_rssi_db": -58,
     "esp_temperature_c": 34.2,
     "uptime_s": 23,
