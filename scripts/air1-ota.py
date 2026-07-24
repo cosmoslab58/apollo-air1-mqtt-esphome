@@ -2,17 +2,14 @@
 """
 air1-ota.py — push a firmware image to the Apollo AIR-1 over the air, via MQTT.
 
-Modelled on ../chassis-shield-firmware/scripts/daq-ota.py, deliberately: both
-devices are updated the same way, so the workflow transfers. The mechanism
-differs though. On the R4 the entire receive path is hand-built (resident
-bootloader, SD staging, CRC state machine, rollback). The ESP32-C3 has all of
-that in silicon and in ESPHome, so here the device side is ~30 lines of YAML and
-this script only has to publish a file and say "go".
-
 Why MQTT rather than `esphome run`: push OTA needs the device's address, and
-name_add_mac_suffix makes that `apollo-air-1-<mac>.local` — not something you
-have in the field. The device dials out to the broker, so the broker is always
-a valid rendezvous point regardless of where the unit sits or what its IP is.
+name_add_mac_suffix makes that `apollo-air-1-<mac>.local` — not necessarily
+something you have once the unit is deployed, especially across VLANs or where
+mDNS doesn't cross subnets. The device dials out to the broker, so the broker is
+always a valid rendezvous point regardless of where the unit sits or what IP it
+picked up. The ESP32-C3 supplies the whole receive path (dual app partitions,
+SHA-256 verification, automatic rollback), so this script only has to publish a
+file and say "go".
 
 Flow:
   1. copy firmware.ota.bin (+ an .md5 sidecar) into the static web root,
@@ -51,8 +48,6 @@ YAML = os.path.join(ROOT, "Integrations", "ESPHome", "apollo-air1-mqtt.yaml")
 SECRETS = os.path.join(ROOT, "Integrations", "ESPHome", "secrets.yaml")
 BUILD_BIN = os.path.join(ROOT, "Integrations", "ESPHome", ".esphome", "build",
                          "apollo-air-1", "build", "firmware.ota.bin")
-DEFAULT_PUBLISH_DIR = os.path.expanduser("~/webfiles_static/html/apollo-air1")
-DEFAULT_BASE_URL = "https://cosmoslab.dev/apollo-air1"
 
 
 # --------------------------------------------------------------------------- #
@@ -233,14 +228,23 @@ def main():
     p.add_argument("--bin", default=BUILD_BIN, help="path to firmware.ota.bin")
     p.add_argument("--check", action="store_true", help="report repo vs device version and exit")
     p.add_argument("--dry-run", action="store_true", help="publish the file but don't trigger")
-    p.add_argument("--publish-dir", default=os.environ.get("AIR1_PUBLISH_DIR", DEFAULT_PUBLISH_DIR))
-    p.add_argument("--base-url", default=os.environ.get("AIR1_BASE_URL", DEFAULT_BASE_URL))
+    # Hosting location comes from secrets.yaml (ota_publish_dir / ota_base_url);
+    # an env var or an explicit flag overrides it. No defaults are baked in --
+    # they'd only be right for one deployment.
+    p.add_argument("--publish-dir",
+                   default=os.environ.get("AIR1_PUBLISH_DIR") or
+                   (os.path.expanduser(sec["ota_publish_dir"]) if sec.get("ota_publish_dir") else None))
+    p.add_argument("--base-url",
+                   default=os.environ.get("AIR1_BASE_URL") or sec.get("ota_base_url"))
     p.add_argument("--timeout", type=int, default=240, help="seconds to await confirmation")
     p.add_argument("--broker", default=os.environ.get("AIR1_BROKER") or sec.get("mqtt_broker"))
     p.add_argument("--broker-port", type=int, default=int(os.environ.get("AIR1_BROKER_PORT", 8883)))
     p.add_argument("--user", default=os.environ.get("AIR1_MQTT_USER") or sec.get("mqtt_username"))
     p.add_argument("--password", default=os.environ.get("AIR1_MQTT_PASS") or sec.get("mqtt_password"))
-    p.add_argument("--topic", default=os.environ.get("AIR1_TOPIC") or yaml_substitution("mqtt_topic"))
+    # Topic root: a per-site mqtt_topic in secrets.yaml wins (it's what the
+    # justfile passes to `esphome -s`), otherwise the config's own substitution.
+    p.add_argument("--topic", default=os.environ.get("AIR1_TOPIC")
+                   or sec.get("mqtt_topic") or yaml_substitution("mqtt_topic"))
     p.add_argument("--cafile", default=os.environ.get("AIR1_CAFILE"))
     p.add_argument("--insecure", action="store_true",
                    help="skip broker TLS verification (the broker has a real LE cert, so normally unnecessary)")
@@ -271,6 +275,11 @@ def main():
         else:
             print(f"device   : {dv}  ✓ up to date")
         return
+
+    if not (args.publish_dir and args.base_url):
+        sys.exit("firmware hosting is not configured. Set ota_publish_dir and "
+                 f"ota_base_url in {SECRETS} (see the .example file), or pass "
+                 "--publish-dir / --base-url.")
 
     if not os.path.isfile(args.bin):
         sys.exit(f"no firmware at {args.bin} — run `just build` first")

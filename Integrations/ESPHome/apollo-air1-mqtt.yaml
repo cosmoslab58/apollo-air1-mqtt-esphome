@@ -13,14 +13,15 @@
 #     trigger via a long (3s) button press or by publishing to its MQTT command
 #     topic. See apollo-air1-mqtt-README.md for the OTA procedure.
 #   - `reportAllValues` now also publishes one combined JSON snapshot to
-#     `${mqtt_topic}/state` so Node-RED/InfluxDB can ingest a single message per
-#     wake cycle instead of joining ~20 separate per-entity topics.
+#     `${mqtt_topic}/state`, so a timeseries consumer can ingest a single message
+#     per wake cycle instead of joining ~20 separate per-entity topics.
 #   - `statusCheck` (the boot LED color) now reflects MQTT broker connectivity
 #     instead of Home Assistant API connectivity.
-#   - The MICS-4514 gas sensor (NO2/CO/H2/ethanol/methane/ammonia) is removed:
-#     this unit does not have that optional add-on, so the component would only
-#     fail its I2C init and publish null gas fields. The CO2 add-on (SCD40) is
-#     installed and kept.
+#   - The MICS-4514 gas sensor (NO2/CO/H2/ethanol/methane/ammonia) is removed,
+#     because the unit this was written for does not have that optional add-on
+#     and the component would only fail its I2C init and publish null gas
+#     fields. The CO2 add-on (SCD40) is kept. If your unit HAS the MICS-4514,
+#     copy the `mics_4514:` block back in from upstream `Core.yaml`.
 #   - Continuous-mode data: a 60s `interval:` re-publishes the combined
 #     `${mqtt_topic}/state` snapshot whenever `prevent_sleep` is on (the
 #     default). On USB power the device stays awake and streams one point per
@@ -29,15 +30,27 @@
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
 #     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
-#     name_add_mac_suffix and is not something you'll have in the field; the
-#     broker is always reachable because the device dials out to it. Mirrors the
-#     chassis-shield-firmware workflow. See "Updating (OTA)" in the README.
+#     name_add_mac_suffix and is not something you necessarily have when the unit
+#     is deployed; the broker is always reachable because the device dials out to
+#     it. See "Updating (OTA)" in the README.
+#
+# Everything site-specific (broker host, credentials, CA certificate, firmware
+# publish location) lives in secrets.yaml — see apollo-air1-mqtt.secrets.yaml.example.
+# The only things to change here are the substitutions immediately below.
 
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
   version: "1.1.0-mqtt"
-  mqtt_topic: cosmos-lab/smarthome/air1
+  # Root of this device's MQTT topic tree. Everything else is derived from it:
+  #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
+  #   ${mqtt_topic}/status             online/offline (birth + LWT)
+  #   ${mqtt_topic}/command/ota        pull-OTA trigger
+  #   ${mqtt_topic}/<domain>/<id>/...  ESPHome's per-entity state/command topics
+  mqtt_topic: esphome/apollo-air-1
+  # 8883 = TLS (requires mqtt_ca_cert in secrets.yaml). For a plaintext broker,
+  # set this to 1883 AND comment out the `certificate_authority:` line below.
+  mqtt_port: "8883"
 
 esphome:
   name: "${name}"
@@ -77,8 +90,8 @@ logger:
 # Firmware downloads for the pull-OTA path below. The 4.5s default timeout is far
 # too short for a ~1.1MB image, and the download must not trip the watchdog.
 # verify_ssl uses esp-idf's built-in Mozilla root CA bundle, so https:// to a
-# Let's Encrypt host works with no cert config (unlike the chassis-shield R4,
-# whose plain-HTTP client needed a dedicated non-redirecting endpoint).
+# Let's Encrypt host validates with no cert config of your own. Plain http:// URLs
+# work too, and redirects are followed.
 http_request:
   verify_ssl: true
   timeout: 60s
@@ -109,46 +122,15 @@ web_server:
 mqtt:
   id: mqtt_client
   broker: !secret mqtt_broker
-  port: 8883
+  port: ${mqtt_port}
   username: !secret mqtt_username
   password: !secret mqtt_password
-  # TLS to mqtt.cosmoslab.dev:8883 — same broker + creds as chassis-shield-firmware,
-  # which uses this endpoint. ISRG Root X1 is Let's Encrypt's root CA; the broker's
-  # cert chains to it (openssl-verified). Root is valid until 2035 — only needs a
-  # reflash if the broker's CA ever changes. On the LAN this reaches the broker via
-  # the router's NAT hairpin (mqtt.cosmoslab.dev resolves to the public IP).
-  certificate_authority: |
-    -----BEGIN CERTIFICATE-----
-    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
-    -----END CERTIFICATE-----
+  # TLS. The CA that signed your broker's certificate, as a PEM block in
+  # secrets.yaml (see the example file for how to obtain it). ESPHome's mqtt
+  # component needs an explicit CA -- unlike http_request above, it cannot use
+  # esp-idf's bundled root store. For a PLAINTEXT broker, comment this line out
+  # and set the mqtt_port substitution to 1883.
+  certificate_authority: !secret mqtt_ca_cert
   topic_prefix: ${mqtt_topic}
   discovery: false
   # Pull-OTA trigger. Publish (NOT retained -- see below):
@@ -228,7 +210,7 @@ deep_sleep:
   run_duration: 2min
 
 # Continuous (USB) mode: while prevent_sleep is on, re-publish the combined
-# /state snapshot every 60s so Node-RED/InfluxDB keep getting data. The
+# /state snapshot every 60s so your consumer keeps getting data. The
 # switch.is_on check is only read here as a "running continuously?" flag --
 # it does NOT re-prevent sleep (that latches once when the switch turns on).
 # In battery/duty-cycle mode (prevent_sleep off) this stays quiet and the

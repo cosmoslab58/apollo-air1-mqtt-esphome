@@ -1,5 +1,26 @@
 # Apollo AIR-1
 
+> ### This fork adds MQTT-only firmware (no Home Assistant)
+>
+> Upstream's configs all use Home Assistant's native API. This fork adds
+> **[`Integrations/ESPHome/apollo-air1-mqtt.yaml`](Integrations/ESPHome/apollo-air1-mqtt.yaml)**,
+> which replaces it with `mqtt:` so the AIR-1 can feed Node-RED, Telegraf, or
+> any other MQTT consumer directly. See
+> **[the MQTT firmware README](Integrations/ESPHome/apollo-air1-mqtt-README.md)**.
+>
+> Two pieces may be useful even if you don't own an AIR-1:
+>
+> - **One combined JSON snapshot per cycle** on `<topic>/state`, instead of
+>   rejoining ~20 per-entity topics to reconstruct a single reading.
+> - **MQTT-triggered pull OTA** — publish a firmware URL and the device fetches
+>   and installs it itself, so updates never need the device's IP or hostname.
+>   Handy for units behind a VLAN or anywhere mDNS doesn't reach. The pattern is
+>   generic ESPHome, not AIR-1-specific.
+>
+> Everything else below is upstream's documentation, unchanged.
+
+---
+
 [![Apollo AIR-1](https://img.youtube.com/vi/Tqq4Si1y34c/hqdefault.jpg)](https://www.youtube.com/watch?v=Tqq4Si1y34c)
 
 

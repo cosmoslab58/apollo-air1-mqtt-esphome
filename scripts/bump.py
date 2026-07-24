@@ -2,9 +2,9 @@
 """
 bump.py — bump the `version:` substitution in apollo-air1-mqtt.yaml.
 
-Mirrors ../chassis-shield-firmware/scripts/bump.py. The version string carries a
-`-mqtt` suffix (e.g. "1.1.0-mqtt") to distinguish this firmware from upstream
-Apollo builds; the suffix is preserved across bumps.
+The version string carries a `-mqtt` suffix by default (e.g. "1.1.0-mqtt") to
+distinguish this firmware from upstream Apollo builds. Any suffix you use is
+preserved across bumps, and no suffix works fine too.
 
 The version matters operationally, not just cosmetically: the device compares
 the version in an incoming OTA command against its own compiled-in value and

@@ -1,51 +1,78 @@
 # Apollo AIR-1 — MQTT firmware
 
 Custom [ESPHome](https://esphome.io/) firmware for the [Apollo Automation AIR-1](https://apolloautomation.com/products/air-1)
-air quality sensor (ESP32-C3), configured with the CO2 add-on (SCD40) installed.
-No Home Assistant — the device talks directly to a Mosquitto MQTT broker, and
-[Node-RED](../coslab-nodered-flows) picks the readings up from there and writes
-them into InfluxDB.
+air quality sensor (ESP32-C3) that talks **directly to an MQTT broker, with no
+Home Assistant anywhere in the picture**. Upstream's configs all assume HA's
+native API; this one replaces it with `mqtt:`, so the readings land somewhere
+any MQTT consumer can pick them up — Node-RED, Telegraf, a custom subscriber,
+whatever you already run.
 
 ```
-Apollo AIR-1  --MQTT-->  mosquitto (bodhi)  --MQTT-->  Node-RED  --Flux write-->  InfluxDB (bucket: air_quality)
+Apollo AIR-1  --MQTT-->  your broker  -->  your consumer (Node-RED / Telegraf / ...)
 ```
+
+Two things here may be useful even if you don't own an AIR-1:
+
+- **One combined JSON snapshot per cycle** on `<topic>/state`, instead of
+  rejoining ~20 separate per-entity topics to reconstruct a single reading.
+- **MQTT-triggered pull OTA** — publish a firmware URL and the device fetches
+  and installs it itself, so updates never need the device's IP or hostname.
+  See [Updating (OTA)](#updating-ota). The pattern is not AIR-1-specific.
+
+## Configuration
+
+Everything site-specific lives in `secrets.yaml` (gitignored) — broker host,
+credentials, CA certificate, and where firmware images are hosted. Start from
+`apollo-air1-mqtt.secrets.yaml.example`, which documents each key.
+
+The only things to edit in `apollo-air1-mqtt.yaml` itself are the substitutions
+at the top:
+
+| Substitution | Default | Purpose |
+|---|---|---|
+| `name` / `friendly_name` | `apollo-air-1` | ESPHome device name |
+| `version` | `1.1.0-mqtt` | firmware version; the OTA path compares it |
+| `mqtt_topic` | `esphome/apollo-air-1` | root of the topic tree; everything derives from it |
+| `mqtt_port` | `8883` | `8883` TLS, or `1883` plaintext (also comment out `certificate_authority:`) |
+
+If you already have a topic convention and would rather not carry a local edit
+to a tracked file, set `mqtt_topic` in `secrets.yaml` instead — the justfile
+passes it through as `esphome -s mqtt_topic <value>` and the OTA script reads it
+from the same place, so the two stay in sync.
 
 ## Hardware
 
 - ESP32-C3, SEN55 (PM1/2.5/4/10, VOC index, NOx index, temperature, humidity),
-  DPS310 (pressure), SCD40 (CO2 — optional add-on, installed on this unit),
-  WS2812 RGB status LED, physical button. (The optional MICS-4514 gas sensor
-  is not installed on this unit, so it is left out of the firmware.)
+  DPS310 (pressure), WS2812 RGB status LED, physical button.
+- **SCD40 (CO2)** — an optional add-on, and this config assumes it is installed.
+- **MICS-4514 (NO2/CO/H2/ethanol/methane/ammonia)** — the other optional add-on,
+  left out here because the unit this was written for doesn't have it (the
+  component would only fail its I2C init and publish null gas fields). If your
+  unit does have it, copy the `mics_4514:` block back in from upstream
+  `Core.yaml`.
 - Battery/USB powered, runs on a deep-sleep duty cycle: wakes, reads all
   sensors, publishes over MQTT, sleeps for 5 minutes (configurable via the
   "Sleep Duration" number entity), repeat. A 2-minute run-duration failsafe
   forces sleep even if MQTT never connects.
 - **Continuous (USB) mode:** `prevent_sleep` defaults on, so a freshly flashed
   unit on USB power never deep-sleeps, and a 60s `interval:` re-publishes the
-  combined `${mqtt_topic}/state` snapshot every minute — InfluxDB/the dashboard
-  get one point per minute. This is the recommended mode for a plugged-in
-  monitor (the SEN55 VOC/NOx gas-index algorithm needs continuous runtime to
-  learn its baseline). Turn `prevent_sleep` off (dashboard Sleep toggle, the
-  device's web UI, or its MQTT command topic) to fall back to the battery/
-  duty-cycle behavior above (one publish per 5-minute wake).
+  combined `${mqtt_topic}/state` snapshot every minute. This is the recommended
+  mode for a plugged-in monitor — the SEN55 VOC/NOx gas-index algorithm needs
+  continuous runtime to learn its baseline. Turn `prevent_sleep` off (the
+  device's web UI or its MQTT command topic) to fall back to the battery
+  duty-cycle behavior above, one publish per 5-minute wake.
 
-## Relationship to upstream
-
-This lives in a real GitHub fork of
-[ApolloAutomation/AIR-1](https://github.com/ApolloAutomation/AIR-1), as
-`apollo-air1-mqtt.yaml` alongside their own `Core.yaml`/`AIR-1.yaml` in this
-same directory — the ESP32-C3 pinout, i2c bus, sensor platforms, and
-deep-sleep timing all come directly from `Core.yaml`. The only substantive
-change is swapping Home Assistant's native `api:` component for `mqtt:`,
-since this deployment doesn't run Home Assistant. See the comment block at
-the top of `apollo-air1-mqtt.yaml` for the full list of deltas. Diff against
-upstream any time with `git fetch upstream && git diff upstream/main --
-Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
+  Note that `prevent_sleep` is **persistent** — once turned off it stays off
+  across reboots and power cycles, so a USB unit that quietly starts
+  duty-cycling has probably had that switch flipped.
 
 ## MQTT
 
-- Combined snapshot (what Node-RED subscribes to): **`cosmos-lab/smarthome/air1/state`**,
-  one retained-off JSON message per wake cycle:
+Topics below are written relative to the `mqtt_topic` substitution, shown here
+with its default `esphome/apollo-air-1`.
+
+- **`<topic>/state`** — the data path. One non-retained JSON message per cycle,
+  carrying every reading at once:
 
   ```json
   {
@@ -68,23 +95,28 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
   }
   ```
 
-- OTA trigger (publish, never retained): **`cosmos-lab/smarthome/air1/command/ota`** —
-  see "Updating (OTA)" below.
+  Publishing one combined message rather than ~20 per-entity ones means a
+  consumer gets a complete, self-consistent reading without having to join
+  topics or wait for stragglers.
+
+- **`<topic>/command/ota`** — pull-OTA trigger. Publish here, never retained.
+  See [Updating (OTA)](#updating-ota).
+- **`<topic>/status`** — `online` / `offline` (MQTT birth message + LWT).
 - ESPHome's `mqtt:` component also auto-publishes every entity individually
-  under `cosmos-lab/smarthome/air1/<component>/<object_id>/state` (e.g.
-  `cosmos-lab/smarthome/air1/sensor/co2/state`), and command topics for the switches/buttons
-  (e.g. `cosmos-lab/smarthome/air1/switch/prevent_sleep/command`). Useful for debugging with
-  `mosquitto_sub -t 'cosmos-lab/smarthome/air1/#' -v`; not needed for the normal data path.
-- Availability: `cosmos-lab/smarthome/air1/status` gets `online`/`offline` (MQTT birth/LWT).
+  under `<topic>/<domain>/<object_id>/state` (e.g.
+  `esphome/apollo-air-1/sensor/co2/state`), plus command topics for the switches
+  and buttons (e.g. `<topic>/switch/prevent_sleep/command`). Handy for poking at
+  the device with `mosquitto_sub -t '<topic>/#' -v`; not needed for the normal
+  data path. Home Assistant MQTT discovery is deliberately off (`discovery: false`).
 
 ## Flashing
 
 1. `cp apollo-air1-mqtt.secrets.yaml.example secrets.yaml` (in this directory)
-   and fill in your WiFi SSID/password, an OTA password, and mosquitto
-   host/username/password. The broker is `mqtt.cosmoslab.dev:8883` over TLS
-   (the `iot` stack on `bodhi`, same endpoint the chassis firmware uses); the
-   firmware embeds the Let's Encrypt root CA (ISRG Root X1) to verify it, and
-   the port (8883) is set in `apollo-air1-mqtt.yaml`, not the secrets file.
+   and fill it in — WiFi credentials, an OTA password, your broker host and
+   credentials, and the CA that signed your broker's certificate. The example
+   file explains each key, and ships with Let's Encrypt's ISRG Root X1 already
+   in place since that covers the common case. Set the broker port via the
+   `mqtt_port` substitution in `apollo-air1-mqtt.yaml`, not here.
 2. First flash over USB (from the repo root):
    ```
    just install
@@ -106,22 +138,27 @@ just logs           # live device logs over MQTT
 
 The reason it works this way rather than `esphome run`: push OTA needs the
 device's address, and `name_add_mac_suffix: true` makes that
-`apollo-air-1-<mac>.local` — not something you'll have to hand in the field.
+`apollo-air-1-<mac>.local` — not necessarily something you have once the unit is
+deployed, particularly across VLANs or anywhere mDNS doesn't cross subnets.
 (`.esphome/storage/…json` even records a plain `apollo-air-1.local`, which won't
 resolve.) The device dials *out* to the broker, so the broker is a reliable
-rendezvous point no matter where the unit sits or what IP it picked up. This
-mirrors how [`chassis-shield-firmware`](../chassis-shield-firmware) is updated,
-so both devices are operated the same way.
+rendezvous point no matter where the unit sits or what IP it picked up.
+
+**Setup:** point `ota_publish_dir` and `ota_base_url` in `secrets.yaml` at a
+directory you can write to that's served by a web server the *device* can reach.
+Any static host works — nginx, Caddy, Apache, even `python3 -m http.server`.
+The device follows redirects and validates HTTPS against esp-idf's bundled root
+CAs, so an ordinary Let's Encrypt site needs no extra configuration.
 
 What `just ota` does:
 
 1. bumps the `version:` substitution and rebuilds
-2. copies `firmware.ota.bin` + an `.md5` sidecar into
-   `~/webfiles_static/html/apollo-air1/` under a version-stamped filename
+2. copies `firmware.ota.bin` + an `.md5` sidecar into `ota_publish_dir` under a
+   version-stamped filename
 3. checks the URL returns a direct HTTP 200 of the right length
-4. publishes to `cosmos-lab/smarthome/air1/command/ota`:
+4. publishes to `<topic>/command/ota`:
    ```json
-   {"command":"ota","url":"https://cosmoslab.dev/apollo-air1/apollo-air-1-1.2.0-mqtt.ota.bin","version":"1.2.0-mqtt"}
+   {"command":"ota","url":"https://example.com/apollo-air1/apollo-air-1-1.2.0-mqtt.ota.bin","version":"1.2.0-mqtt"}
    ```
 5. waits for the device to reboot and report the new version back
 
@@ -153,15 +190,23 @@ duty-cycling on USB has probably had that switch flipped.
 
 The SCD40 needs periodic forced calibration for accurate absolute readings.
 The `Calibrate SCD40 To 420ppm` button (device web UI, or publish any payload
-to `cosmos-lab/smarthome/air1/button/set_scd40_calibrate/command`) performs a forced
-calibration assuming the sensor is currently in fresh outdoor air (~420ppm) —
-run it outdoors, or in a well-ventilated room after a few minutes of
-air exchange.
+to `<topic>/button/set_scd40_calibrate/command`) performs a forced calibration
+assuming the sensor is currently in fresh outdoor air (~420ppm) — run it
+outdoors, or in a well-ventilated room after a few minutes of air exchange.
 
-## Related repos
+## Relationship to upstream
 
-- [`coslab-nodered-flows`](../coslab-nodered-flows) — the "Apollo AIR-1" tab
-  (MQTT in → InfluxDB out) lives there, since that repo tracks the live
-  Node-RED instance directly.
-- [`apollo-air1-dashboard`](../apollo-air1-dashboard) — web app for viewing
-  current readings and history from InfluxDB.
+This is a fork of [ApolloAutomation/AIR-1](https://github.com/ApolloAutomation/AIR-1);
+`apollo-air1-mqtt.yaml` sits alongside their own `Core.yaml` / `AIR-1.yaml` in
+this directory. The ESP32-C3 pinout, I2C bus, sensor platforms, deep-sleep
+timing, and RGB status logic all come straight from `Core.yaml`. The substantive
+changes are swapping Home Assistant's native `api:` for `mqtt:`, adding the
+combined `/state` snapshot, and adding pull OTA — see the comment block at the
+top of `apollo-air1-mqtt.yaml` for the full list.
+
+Diff against upstream any time:
+
+```
+git fetch upstream
+git diff upstream/main -- Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml
+```
