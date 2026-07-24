@@ -33,3 +33,7 @@
 Integrations/ESPHome/.DS_Store
 Integrations/.DS_Store
 .DS_Store
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc

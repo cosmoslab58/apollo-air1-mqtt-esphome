@@ -26,6 +26,12 @@
 #     default). On USB power the device stays awake and streams one point per
 #     minute; on battery (prevent_sleep off) it reverts to one publish per
 #     deep-sleep wake. See apollo-air1-mqtt-README.md.
+#   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
+#     and the device downloads + installs it itself. Push OTA (`esphome run`)
+#     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
+#     name_add_mac_suffix and is not something you'll have in the field; the
+#     broker is always reachable because the device dials out to it. Mirrors the
+#     chassis-shield-firmware workflow. See "Updating (OTA)" in the README.
 
 substitutions:
   name: apollo-air-1
@@ -68,10 +74,25 @@ esp32:
 
 logger:
 
+# Firmware downloads for the pull-OTA path below. The 4.5s default timeout is far
+# too short for a ~1.1MB image, and the download must not trip the watchdog.
+# verify_ssl uses esp-idf's built-in Mozilla root CA bundle, so https:// to a
+# Let's Encrypt host works with no cert config (unlike the chassis-shield R4,
+# whose plain-HTTP client needed a dedicated non-redirecting endpoint).
+http_request:
+  verify_ssl: true
+  timeout: 60s
+  buffer_size_rx: 2048
+  watchdog_timeout: 120s
+
 ota:
+  # Push OTA — kept as the bench/recovery path (`esphome run`), needs the address.
   - platform: esphome
     id: ota_esphome
     password: !secret ota_password
+  # Pull OTA — driven by the ${mqtt_topic}/command/ota trigger in the mqtt block.
+  - platform: http_request
+    id: ota_http
 
 wifi:
   ssid: !secret wifi_ssid
@@ -130,6 +151,38 @@ mqtt:
     -----END CERTIFICATE-----
   topic_prefix: ${mqtt_topic}
   discovery: false
+  # Pull-OTA trigger. Publish (NOT retained -- see below):
+  #   {"command":"ota","url":"https://host/path/firmware.ota.bin","version":"1.2.0"}
+  # to ${mqtt_topic}/command/ota. The device fetches the image itself, so the
+  # publisher never needs the device's IP or hostname -- only the broker.
+  #
+  # NEVER publish this retained: the broker would replay it on every reconnect,
+  # and the device reconnects immediately after an OTA reboot -- an endless
+  # reflash loop. The version guard below is the backstop if that ever happens
+  # by accident, and also makes re-sending the same command a no-op.
+  on_json_message:
+    - topic: ${mqtt_topic}/command/ota
+      qos: 1
+      then:
+        - if:
+            condition:
+              lambda: |-
+                std::string url(x["url"] | "");
+                std::string ver(x["version"] | "");
+                if (url.empty()) {
+                  ESP_LOGE("ota", "OTA command has no 'url' field - ignoring");
+                  return false;
+                }
+                if (ver == "${version}") {
+                  ESP_LOGI("ota", "OTA command for %s, already running it - skipping", ver.c_str());
+                  return false;
+                }
+                ESP_LOGW("ota", "OTA command: %s -> %s (running ${version})", ver.c_str(), url.c_str());
+                return true;
+            then:
+              - ota.http_request.flash:
+                  url: !lambda 'return std::string(x["url"] | "");'
+                  md5_url: !lambda 'return std::string(x["url"] | "") + ".md5";'
   on_connect:
     - delay: 20s
     - lambda: |-

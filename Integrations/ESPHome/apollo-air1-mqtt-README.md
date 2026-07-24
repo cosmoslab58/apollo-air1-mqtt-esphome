@@ -68,6 +68,8 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
   }
   ```
 
+- OTA trigger (publish, never retained): **`cosmos-lab/smarthome/air1/command/ota`** —
+  see "Updating (OTA)" below.
 - ESPHome's `mqtt:` component also auto-publishes every entity individually
   under `cosmos-lab/smarthome/air1/<component>/<object_id>/state` (e.g.
   `cosmos-lab/smarthome/air1/sensor/co2/state`), and command topics for the switches/buttons
@@ -83,17 +85,69 @@ Integrations/ESPHome/Core.yaml Integrations/ESPHome/apollo-air1-mqtt.yaml`.
    (the `iot` stack on `bodhi`, same endpoint the chassis firmware uses); the
    firmware embeds the Let's Encrypt root CA (ISRG Root X1) to verify it, and
    the port (8883) is set in `apollo-air1-mqtt.yaml`, not the secrets file.
-2. First flash over USB:
+2. First flash over USB (from the repo root):
    ```
-   esphome run apollo-air1-mqtt.yaml
+   just install
    ```
-3. Subsequent updates can go over OTA the same way, as long as the device is
-   awake — either wait for its next wake cycle, or wake it manually and hold
-   the button for 3s (turns the `Prevent Sleep` switch on, which also stops
-   the deep-sleep timer) so it doesn't go back to sleep mid-flash. Turn
-   `Prevent Sleep` back off afterwards (via the web UI at the device's IP, or
-   by publishing to `cosmos-lab/smarthome/air1/switch/prevent_sleep/command`) to resume the
-   normal duty cycle.
+   This one-time push is what puts the pull-OTA agent on the device. Everything
+   after it goes over MQTT.
+
+## Updating (OTA)
+
+Updates are **pull-based and triggered over MQTT**: you publish a firmware URL,
+and the device downloads and installs the image itself.
+
+```
+just ota            # bump patch, build, publish, trigger
+just ota minor      # or major, or an explicit 1.4.0
+just check          # what's the device running vs. this repo?
+just logs           # live device logs over MQTT
+```
+
+The reason it works this way rather than `esphome run`: push OTA needs the
+device's address, and `name_add_mac_suffix: true` makes that
+`apollo-air-1-<mac>.local` — not something you'll have to hand in the field.
+(`.esphome/storage/…json` even records a plain `apollo-air-1.local`, which won't
+resolve.) The device dials *out* to the broker, so the broker is a reliable
+rendezvous point no matter where the unit sits or what IP it picked up. This
+mirrors how [`chassis-shield-firmware`](../chassis-shield-firmware) is updated,
+so both devices are operated the same way.
+
+What `just ota` does:
+
+1. bumps the `version:` substitution and rebuilds
+2. copies `firmware.ota.bin` + an `.md5` sidecar into
+   `~/webfiles_static/html/apollo-air1/` under a version-stamped filename
+3. checks the URL returns a direct HTTP 200 of the right length
+4. publishes to `cosmos-lab/smarthome/air1/command/ota`:
+   ```json
+   {"command":"ota","url":"https://cosmoslab.dev/apollo-air1/apollo-air-1-1.2.0-mqtt.ota.bin","version":"1.2.0-mqtt"}
+   ```
+5. waits for the device to reboot and report the new version back
+
+The device writes the image to its spare flash partition, reboots into it, and
+ESP-IDF rolls back to the previous partition automatically if the new firmware
+doesn't stay up — none of which needs configuring, it's built into the chip.
+TLS works out of the box too: ESPHome's `http_request` verifies against esp-idf's
+bundled Mozilla root CA store, so plain `https://` is fine.
+
+> **Never publish the OTA command retained.** The broker would replay it on
+> every reconnect, and the device reconnects right after an OTA reboot — an
+> endless reflash loop. `air1-ota.py` always publishes with `retain=False`. As a
+> backstop the firmware compares the payload's `version` against its own and
+> skips the flash when they match, which also makes re-sending a command safe.
+
+Push OTA is still available as a bench/recovery path (`just install` over USB,
+or `just install-net <address>`), and is password-protected via `ota_password`.
+
+### Deep sleep and OTA
+
+On USB the unit stays awake (`prevent_sleep` defaults on), so an OTA can land at
+any time. On battery it's only awake ~2 minutes per cycle, so hold the button for
+3s first — that turns `Prevent Sleep` on and stops the deep-sleep timer — then
+trigger the update. Note that `prevent_sleep` is **persistent**: once turned off
+it stays off across reboots and power cycles, so a unit that quietly starts
+duty-cycling on USB has probably had that switch flipped.
 
 ## CO2 calibration
 
