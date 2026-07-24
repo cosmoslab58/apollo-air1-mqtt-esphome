@@ -37,3 +37,12 @@ Integrations/.DS_Store
 # Python bytecode from scripts/
 __pycache__/
 *.pyc
+
+# Secrets — unanchored so they match at ANY depth. Do not remove.
+# Integrations/ESPHome/.gitignore also covers these, but only for that one
+# directory and only while that (upstream-owned) file survives. These rules are
+# the backstop: secrets.yaml holds the real WiFi/MQTT/OTA credentials, and
+# ESPHome writes a fully-expanded copy of the config -- OTA password in
+# plaintext -- to .esphome/storage/*.validated.yaml on every build.
+secrets.yaml
+.esphome/
