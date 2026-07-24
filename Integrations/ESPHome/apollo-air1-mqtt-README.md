@@ -147,8 +147,15 @@ rendezvous point no matter where the unit sits or what IP it picked up.
 **Setup:** point `ota_publish_dir` and `ota_base_url` in `secrets.yaml` at a
 directory you can write to that's served by a web server the *device* can reach.
 Any static host works — nginx, Caddy, Apache, even `python3 -m http.server`.
-The device follows redirects and validates HTTPS against esp-idf's bundled root
-CAs, so an ordinary Let's Encrypt site needs no extra configuration.
+
+Either scheme is fine. `https://` needs no extra configuration — the ESP32
+validates against esp-idf's bundled root CAs, which is a separate trust store
+from the `mqtt_ca_cert` used for the broker. `http://` works too and is one
+fewer certificate to keep valid, at the cost of the image being unauthenticated
+in transit; the `.md5` sidecar travels the same path, so it catches corruption
+but not tampering. Redirects are followed either way, though `air1-ota.py`
+insists on a direct 200 so a misconfigured host fails loudly rather than
+serving the device an HTML redirect page.
 
 What `just ota` does:
 
