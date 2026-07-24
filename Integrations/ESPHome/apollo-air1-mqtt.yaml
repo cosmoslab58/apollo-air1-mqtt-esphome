@@ -27,6 +27,11 @@
 #     default). On USB power the device stays awake and streams one point per
 #     minute; on battery (prevent_sleep off) it reverts to one publish per
 #     deep-sleep wake. See apollo-air1-mqtt-README.md.
+#   - Air danger alarm: the RGB LED strobes through colors while CO2 / AQI /
+#     VOC are at genuinely harmful levels (thresholds and rationale in the
+#     substitutions below). Upstream drives the LED as a continuous air-quality
+#     indicator via an "Air Quality LED Source" select; this is instead a quiet
+#     LED that only lights for an emergency. See the README.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
 #     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
@@ -41,7 +46,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.2-mqtt"
+  version: "1.1.5-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -51,6 +56,28 @@ substitutions:
   # 8883 = TLS (requires mqtt_ca_cert in secrets.yaml). For a plaintext broker,
   # set this to 1883 AND comment out the `certificate_authority:` line below.
   mqtt_port: "8883"
+
+  # --- Air danger alarm ------------------------------------------------------
+  # Thresholds at which the RGB LED strobes through colors as a get-out-of-the-
+  # room signal. These are deliberately set at genuinely HARMFUL levels, not
+  # merely "poor air" ones -- an alarm that cries wolf at a stuffy 1200ppm gets
+  # ignored when it matters. Node-RED already sends a Gotify nudge at the softer
+  # 1000ppm / AQI 100 marks; this is the tier above that.
+  #
+  #   co2   5000 ppm : the ACGIH TLV / OSHA PEL 8-hour occupational limit.
+  #                    1000-2000 is stuffy and measurably hurts concentration,
+  #                    but is not itself dangerous.
+  #   aqi   200      : EPA "Very Unhealthy" -- health alert, everyone may
+  #                    experience serious effects. Derived from PM2.5 + PM10,
+  #                    so particulates are already covered by this one number.
+  #   voc   400      : top band of the VOC Quality text sensor ("Extremely
+  #                    abnormal"). The VOC Index is RELATIVE to a ~72h learned
+  #                    baseline, not an absolute concentration, so treat this as
+  #                    "something changed badly" (solvent, smoke, off-gassing)
+  #                    rather than a calibrated toxicity threshold.
+  danger_co2_ppm: "5000"
+  danger_aqi: "200"
+  danger_voc_index: "400"
 
 esphome:
   name: "${name}"
@@ -195,6 +222,16 @@ globals:
     restore_value: no
     initial_value: "0"
   - id: dps310Passed
+    restore_value: no
+    type: bool
+    initial_value: "false"
+  # Latches whether the air-danger alarm is currently showing, so airDangerCheck
+  # only acts on transitions. Without it, every 60s cycle would re-issue
+  # turn_on and restart the strobe from its first color, making the alarm
+  # visibly stutter once a minute. Deliberately not restored across reboots:
+  # the alarm state should be re-derived from live readings on boot, never
+  # replayed from flash.
+  - id: air_danger_active
     restore_value: no
     type: bool
     initial_value: "false"
@@ -497,6 +534,54 @@ light:
           update_interval: 100ms
           min_brightness: 50%
           max_brightness: 100%
+      # Air danger alarm. Cycles saturated colors with dark gaps between them --
+      # the changing hue plus the blink is what makes it read as an alarm from
+      # the corner of your eye rather than as ordinary status lighting (the
+      # boot statusCheck already uses steady blue/green/yellow). Driven by the
+      # airDangerCheck script, not selectable as a mood effect.
+      - strobe:
+          name: "Air Danger"
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 150ms
+            - state: false
+              duration: 60ms
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 100%
+              blue: 100%
+              duration: 150ms
+            - state: false
+              duration: 60ms
+            - state: true
+              brightness: 100%
+              red: 0%
+              green: 0%
+              blue: 100%
+              duration: 150ms
+            - state: false
+              duration: 60ms
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 60%
+              blue: 0%
+              duration: 150ms
+            - state: false
+              duration: 60ms
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 100%
+              duration: 150ms
+            - state: false
+              duration: 60ms
 
 button:
   - platform: restart
@@ -643,6 +728,50 @@ script:
                 - light.turn_off:
                     id: rgb_light
 
+  # Strobes the RGB LED through colors while any reading is at a level that is
+  # actually harmful to breathe, and clears it once everything is back under.
+  # Thresholds and their justification live in the substitutions at the top.
+  #
+  # Runs at the end of reportAllValues, so it re-evaluates on every publish:
+  # once a minute on USB power, and once per wake in battery/deep-sleep mode
+  # (where the LED is necessarily dark while asleep -- this is a mains-powered
+  # feature in practice).
+  - id: airDangerCheck
+    mode: single
+    then:
+      - lambda: |-
+          // Do NOT name these after entity ids -- id(co2) generates `co2->state`,
+          // so a local called `co2` shadows the entity pointer and fails to
+          // compile with "base operand of '->' is not a pointer".
+          const float co2_ppm = id(co2).state;
+          const float aqi_val = id(nowcast_aqi).state;
+          const float voc_val = id(sen55_voc).state;
+          // NaN-guarded: a sensor that has not produced a reading yet (SCD40
+          // needs a warm-up, and NOx/VOC start as NaN after a baseline reset)
+          // must never be treated as a danger. Comparing NaN yields false
+          // anyway, but being explicit keeps it obvious that a dead sensor
+          // fails SAFE-looking -- see the caveat in the README.
+          const bool danger =
+              (!isnan(co2_ppm) && co2_ppm >= ${danger_co2_ppm}) ||
+              (!isnan(aqi_val) && aqi_val >= ${danger_aqi}) ||
+              (!isnan(voc_val) && voc_val >= ${danger_voc_index});
+
+          if (danger == id(air_danger_active)) {
+            return;  // no transition, leave the strobe running or the LED off
+          }
+          id(air_danger_active) = danger;
+
+          if (danger) {
+            ESP_LOGW("Apollo", "AIR DANGER: co2=%.0fppm aqi=%.0f voc=%.0f -- alarm ON", co2_ppm, aqi_val, voc_val);
+            auto call = id(rgb_light).turn_on();
+            call.set_effect("Air Danger");
+            call.perform();
+          } else {
+            ESP_LOGI("Apollo", "Air back within safe limits -- alarm OFF");
+            auto call = id(rgb_light).turn_off();
+            call.perform();
+          }
+
   - id: statusCheck
     then:
       - if:
@@ -712,3 +841,6 @@ script:
             root["esp_temperature_c"] = id(sys_esp_temperature).state;
             root["uptime_s"] = id(sys_uptime).state;
             root["firmware_version"] = "${version}";
+      # Re-evaluate the air-danger alarm against the readings just published,
+      # so the LED and the snapshot can never disagree about the same cycle.
+      - script.execute: airDangerCheck

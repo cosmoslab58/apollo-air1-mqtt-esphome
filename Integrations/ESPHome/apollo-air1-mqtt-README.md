@@ -109,6 +109,45 @@ with its default `esphome/apollo-air-1`.
   the device with `mosquitto_sub -t '<topic>/#' -v`; not needed for the normal
   data path. Home Assistant MQTT discovery is deliberately off (`discovery: false`).
 
+## Air danger alarm
+
+The RGB LED strobes through saturated colors (red → white → blue → amber →
+magenta, with dark gaps) whenever a reading crosses a level that is genuinely
+harmful to breathe. It clears itself once everything is back under.
+
+| Reading | Threshold | Why |
+|---|---|---|
+| CO2 | **5000 ppm** | ACGIH TLV / OSHA PEL 8-hour occupational limit |
+| AQI | **200** | EPA "Very Unhealthy"; derived from PM2.5 + PM10, so particulates are covered by this one number |
+| VOC Index | **400** | Top band of `VOC Quality` ("Extremely abnormal") |
+
+Tune them in the `substitutions:` at the top of `apollo-air1-mqtt.yaml`
+(`danger_co2_ppm`, `danger_aqi`, `danger_voc_index`).
+
+These sit deliberately high. 1000–2000 ppm CO2 is stuffy and measurably hurts
+concentration, but it is not dangerous, and an alarm that fires every afternoon
+in a closed office is one you stop seeing. The softer "you should ventilate"
+tier is already handled by the Node-RED Gotify alert at 1000 ppm / AQI 100 —
+this is the tier above that, meant to read as *leave the room*.
+
+Notes and caveats:
+
+- **The VOC trigger is relative, not absolute.** The VOC Index is scored against
+  a ~72h learned baseline, so 400 means "something changed badly versus recent
+  normal" — smoke, solvent, off-gassing — not a calibrated toxicity level.
+- **A dead sensor does not raise the alarm.** Readings are NaN-guarded, so a
+  sensor that never reports reads as "not dangerous". This is an alerting
+  convenience, not a life-safety device — it is not a substitute for a CO or
+  smoke alarm, neither of which this hardware can detect at all.
+- **It is a mains-powered feature in practice.** Evaluation happens on each
+  publish, so on USB power that is once a minute. On battery the device is
+  asleep (and the LED dark) for most of each 5-minute cycle.
+- The alarm is edge-triggered — it fires once on the transition rather than
+  re-issuing every cycle, so the strobe runs continuously instead of restarting
+  from its first color every minute.
+- It overrides the LED, so it will paint over the boot status colors
+  (blue/green/yellow) that `statusCheck` shows for the first 5 seconds.
+
 ## Flashing
 
 1. `cp apollo-air1-mqtt.secrets.yaml.example secrets.yaml` (in this directory)
