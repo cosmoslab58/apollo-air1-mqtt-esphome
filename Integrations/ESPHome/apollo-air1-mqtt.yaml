@@ -342,6 +342,16 @@ sensor:
     co2:
       name: "CO2"
       id: "co2"
+    # OFF deliberately, and unlike upstream there is no runtime switch for it.
+    # ASC re-baselines by treating the lowest CO2 seen over a multi-day window
+    # as fresh outdoor air (~400ppm). That assumption holds for a sensor that
+    # gets aired out and is actively wrong for one that lives indoors
+    # permanently: an occupied room rarely bottoms out at 400ppm, so ASC would
+    # walk the baseline down and under-report. Use the
+    # `Calibrate SCD40 To 420ppm` button outdoors instead (see the README).
+    # Upstream's toggle needs a script of raw I2C commands -- the SCD40 only
+    # accepts the setting while idle and forgets it on power loss -- which is
+    # not worth carrying for a setting that should stay off here.
     automatic_self_calibration: false
     update_interval: 60s
     measurement_mode: "periodic"

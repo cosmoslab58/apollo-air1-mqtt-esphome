@@ -195,11 +195,26 @@ duty-cycling on USB has probably had that switch flipped.
 
 ## CO2 calibration
 
-The SCD40 needs periodic forced calibration for accurate absolute readings.
-The `Calibrate SCD40 To 420ppm` button (device web UI, or publish any payload
-to `<topic>/button/set_scd40_calibrate/command`) performs a forced calibration
-assuming the sensor is currently in fresh outdoor air (~420ppm) — run it
-outdoors, or in a well-ventilated room after a few minutes of air exchange.
+The SCD40's **automatic self-calibration (ASC) is deliberately off** here
+(`automatic_self_calibration: false`). ASC re-baselines the sensor by assuming
+the lowest CO2 it sees over a multi-day window is fresh outdoor air (~400ppm).
+That holds for a sensor that gets aired out regularly and is actively wrong for
+one that lives indoors permanently — an occupied room rarely drops to 400ppm,
+so ASC would drag the baseline down and under-report. The cost of leaving it off
+is that absolute accuracy drifts unless you calibrate manually, below. (Upstream
+`Core.yaml` exposes a runtime `CO2 Auto Calibration` switch instead; it is not
+ported here. It needs a script of raw I2C commands — stop periodic measurement,
+write 0x2416, restart — because the SCD40 only accepts the setting while idle
+and forgets it on power loss.)
+
+Forced calibration is the manual alternative: the `Calibrate SCD40 To 420ppm`
+button (device web UI, or publish any payload to
+`<topic>/button/calibrate_scd40_to_420ppm/command`) tells the sensor it is in
+fresh outdoor air *right now*.
+
+> Only press it outdoors, or indoors after several minutes of real air
+> exchange. Running it at a normal indoor reading bakes that reading in as
+> 420ppm — a 700ppm room calibrated this way leaves a persistent ~280ppm error.
 
 ## Relationship to upstream
 
