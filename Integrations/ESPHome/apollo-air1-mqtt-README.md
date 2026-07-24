@@ -62,9 +62,18 @@ from the same place, so the two stay in sync.
   device's web UI or its MQTT command topic) to fall back to the battery
   duty-cycle behavior above, one publish per 5-minute wake.
 
-  Note that `prevent_sleep` is **persistent** — once turned off it stays off
-  across reboots and power cycles, so a USB unit that quietly starts
-  duty-cycling has probably had that switch flipped.
+  Note that `prevent_sleep` is `restore_mode: ALWAYS_ON` — it is **forced back
+  on at every boot** and does not persist an off state. You can still turn it
+  off at runtime to get the duty cycle, but a reboot or power cycle returns the
+  unit to continuous mode.
+
+  That is deliberate for a permanently mains-powered monitor. Three things can
+  turn the switch off (the device web UI, an MQTT publish, a dashboard control),
+  and a persisted off is a quiet, lasting degradation: data drops from one point
+  per minute to roughly one per five, the air-danger LED is dark for most of
+  each cycle, and the SEN55 VOC/NOx gas-index algorithms lose the continuous
+  runtime they need to hold their learned baselines. If you are actually running
+  on battery, change this to `RESTORE_DEFAULT_ON` so an off survives reboots.
 
 ## MQTT
 
@@ -228,9 +237,9 @@ or `just install-net <address>`), and is password-protected via `ota_password`.
 On USB the unit stays awake (`prevent_sleep` defaults on), so an OTA can land at
 any time. On battery it's only awake ~2 minutes per cycle, so hold the button for
 3s first — that turns `Prevent Sleep` on and stops the deep-sleep timer — then
-trigger the update. Note that `prevent_sleep` is **persistent**: once turned off
-it stays off across reboots and power cycles, so a unit that quietly starts
-duty-cycling on USB has probably had that switch flipped.
+trigger the update. Since `prevent_sleep` is `ALWAYS_ON`, a unit that is
+duty-cycling has had the switch turned off *this* boot; power-cycling it is
+enough to get back to a continuously awake device you can OTA at will.
 
 ## CO2 calibration
 

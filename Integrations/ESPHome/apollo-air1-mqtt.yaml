@@ -46,7 +46,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.5-mqtt"
+  version: "1.1.6-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -652,7 +652,17 @@ switch:
     name: "Prevent Sleep"
     id: prevent_sleep
     icon: mdi:sleep
-    restore_mode: RESTORE_DEFAULT_ON
+    # ALWAYS_ON, not RESTORE_DEFAULT_ON: this unit is permanently USB-powered,
+    # so continuous mode is the only mode that should survive a reboot.
+    # RESTORE_DEFAULT_ON persists an OFF, and three things can set one (the
+    # dashboard's Setup card, the device web UI, a direct MQTT publish), so a
+    # stray toggle would silently duty-cycle the device forever: data drops
+    # from 1/min to ~1/5min, the air-danger LED is dark for most of each cycle,
+    # and -- worst -- the SEN55 VOC/NOx gas index algorithms lose the
+    # continuous runtime they need to hold their learned baselines. Forcing it
+    # on at boot means a power cycle always recovers. Still toggleable at
+    # runtime if you ever do want the battery duty cycle; it just won't stick.
+    restore_mode: ALWAYS_ON
     optimistic: true
     entity_category: "config"
     on_turn_on:
