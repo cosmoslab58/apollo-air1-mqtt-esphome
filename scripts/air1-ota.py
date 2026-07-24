@@ -21,20 +21,21 @@ Flow:
 Broker credentials come from Integrations/ESPHome/secrets.yaml — the same file
 the firmware compiles against. No env vars required; --flags override.
 
-The broker presents a real Let's Encrypt cert, so TLS verification is ON by
-default here (unlike daq-ota.py, whose lab broker cert isn't system-trusted).
+TLS verification is ON by default; pass --insecure for a broker whose cert
+isn't system-trusted (a private CA, say), or --no-tls for a plaintext broker.
 
 Examples
   ./air1-ota.py                       # publish + trigger the current build
   ./air1-ota.py --check               # just report repo vs device version
   ./air1-ota.py --bin path/to.ota.bin # publish a specific image
   ./air1-ota.py --dry-run             # publish the file, print the command, don't send
+  ./air1-ota.py --subscribe state     # stream sensor snapshots
+  ./air1-ota.py --get mqtt_topic      # resolve one config value
 """
 import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import ssl
 import sys
@@ -42,6 +43,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+import yaml
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 YAML = os.path.join(ROOT, "Integrations", "ESPHome", "apollo-air1-mqtt.yaml")
@@ -53,34 +56,39 @@ BUILD_BIN = os.path.join(ROOT, "Integrations", "ESPHome", ".esphome", "build",
 # --------------------------------------------------------------------------- #
 #  Config from the firmware's own files
 # --------------------------------------------------------------------------- #
-def yaml_substitution(key, path=YAML):
-    """Read a value out of the `substitutions:` block (version, mqtt_topic, ...)."""
+class _IgnoreTags(yaml.SafeLoader):
+    """SafeLoader that tolerates ESPHome's custom tags.
+
+    The device config is full of `!secret` and `!lambda`, which SafeLoader would
+    reject. We only ever read plain scalars out of it, so mapping every `!tag` to
+    None is enough and keeps us from having to model ESPHome's schema.
+    """
+
+
+_IgnoreTags.add_multi_constructor("!", lambda loader, suffix, node: None)
+
+
+def _load_yaml(path, loader=yaml.SafeLoader):
     try:
         with open(path) as f:
-            txt = f.read()
-    except OSError:
-        return None
-    block = re.search(r'^substitutions:\n((?:[ \t]+.*\n|\n)*)', txt, re.M)
-    if not block:
-        return None
-    m = re.search(r'^\s+' + re.escape(key) + r':\s*(.+?)\s*$', block.group(1), re.M)
-    return m.group(1).strip().strip('"\'') if m else None
+            return yaml.load(f, Loader=loader) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def yaml_substitution(key, path=YAML):
+    """Read a value out of the config's `substitutions:` block."""
+    val = _load_yaml(path, _IgnoreTags).get("substitutions", {}).get(key)
+    return None if val is None else str(val)
 
 
 def read_secrets(path=SECRETS):
-    """Flat `key: value` pairs from the ESPHome secrets file. Hand-parsed so the
-    script needs no YAML dependency (paho is the only third-party import)."""
-    out = {}
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.split("#", 1)[0].rstrip()
-                m = re.match(r'^([A-Za-z0-9_]+):\s*(.+)$', line)
-                if m:
-                    out[m.group(1)] = m.group(2).strip().strip('"\'')
-    except OSError:
-        pass
-    return out
+    """The ESPHome secrets file, parsed as the YAML it actually is.
+
+    Worth using a real parser rather than line regexes: the CA certificate is a
+    multi-line block scalar, which a naive `key: value` match reads as "|".
+    """
+    return {k: v for k, v in _load_yaml(path).items() if isinstance(v, (str, int, float))}
 
 
 def semver(s):
@@ -157,6 +165,32 @@ def trigger(args, url, version):
     print(f"  [mqtt] published to {topic}: {payload}")
 
 
+def subscribe(args, suffix):
+    """Stream everything published under <topic>/<suffix> until interrupted.
+
+    Exists so the justfile doesn't have to re-derive the broker settings with a
+    pile of greps and hand them to mosquitto_sub — which would also put the
+    password in the process table where `ps` can see it.
+    """
+    topic = f"{args.topic}/{suffix}"
+
+    def on_connect(c, u, flags, rc, *a):
+        print(f"subscribed to {topic} on {args.broker}:{args.broker_port}", flush=True)
+        c.subscribe(topic, qos=0)
+
+    def on_message(c, u, msg):
+        print(msg.payload.decode(errors="replace"), flush=True)
+
+    c = mqtt_client(args)
+    c.on_connect, c.on_message = on_connect, on_message
+    c.connect(args.broker, args.broker_port, 30)
+    try:
+        c.loop_forever()
+    except KeyboardInterrupt:
+        print("\n(disconnected)")
+        c.disconnect()
+
+
 def wait_for_confirm(args, expected, timeout):
     print(f"confirm  : up to {timeout}s for the device to install and report back...")
     end = time.time() + timeout
@@ -227,6 +261,11 @@ def main():
     sec = read_secrets()
     p.add_argument("--bin", default=BUILD_BIN, help="path to firmware.ota.bin")
     p.add_argument("--check", action="store_true", help="report repo vs device version and exit")
+    p.add_argument("--subscribe", metavar="SUFFIX",
+                   help="stream <topic>/SUFFIX until interrupted (e.g. debug, state)")
+    p.add_argument("--get", metavar="KEY",
+                   help="print one resolved config value and exit (secrets.yaml, "
+                        "then the config's substitutions). Used by the justfile.")
     p.add_argument("--dry-run", action="store_true", help="publish the file but don't trigger")
     # Hosting location comes from secrets.yaml (ota_publish_dir / ota_base_url);
     # an env var or an explicit flag overrides it. No defaults are baked in --
@@ -251,8 +290,21 @@ def main():
     p.add_argument("--no-tls", action="store_true", help="plaintext MQTT")
     args = p.parse_args()
 
+    # --get resolves before the broker check: it's used to read config, and must
+    # work (silently) even on a checkout with no secrets.yaml yet.
+    if args.get:
+        val = sec.get(args.get) or yaml_substitution(args.get)
+        if val is None:
+            return 1
+        print(val)
+        return 0
+
     if not (args.broker and args.topic):
         sys.exit(f"missing broker/topic — check {SECRETS} and the substitutions in {YAML}")
+
+    if args.subscribe:
+        subscribe(args, args.subscribe)
+        return 0
 
     repo_version = yaml_substitution("version")
     if not repo_version:
@@ -322,4 +374,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

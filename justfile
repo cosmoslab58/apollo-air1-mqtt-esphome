@@ -26,12 +26,11 @@ yaml        := "Integrations/ESPHome/apollo-air1-mqtt.yaml"
 build_dir   := justfile_directory() / "Integrations/ESPHome/.esphome/build/apollo-air-1/build"
 ota_bin     := build_dir / "firmware.ota.bin"
 port        := env_var_or_default("AIR1_PORT", "/dev/ttyACM0")
-secrets     := justfile_directory() / "Integrations/ESPHome/secrets.yaml"
 
 # Optional per-site MQTT topic root. If secrets.yaml defines mqtt_topic, it is
 # passed to ESPHome as a substitution override, so the committed config keeps a
 # neutral default and your topic tree lives in the gitignored secrets file.
-site_topic  := `grep -oP '^mqtt_topic:\s*\K.*' Integrations/ESPHome/secrets.yaml 2>/dev/null | tr -d '"' || true`
+site_topic  := `python3 scripts/air1-ota.py --get mqtt_topic 2>/dev/null || true`
 sub         := if site_topic != "" { "-s mqtt_topic " + site_topic } else { "" }
 
 # list all recipes (default)
@@ -69,28 +68,11 @@ check:
 
 # live device logs over MQTT — works without knowing the device's address
 logs:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    topic="{{ if site_topic != "" { site_topic } else { "" } }}"
-    [ -z "$topic" ] && topic="$(grep -oP '^\s+mqtt_topic:\s*\K\S+' {{yaml}})"
-    host="$(grep -oP '^mqtt_broker:\s*\K.*' {{secrets}} | tr -d '"')"
-    user="$(grep -oP '^mqtt_username:\s*\K.*' {{secrets}} | tr -d '"')"
-    pass="$(grep -oP '^mqtt_password:\s*\K.*' {{secrets}} | tr -d '"')"
-    echo "subscribing to $topic/debug on $host:8883"
-    mosquitto_sub -h "$host" -p 8883 --capath /etc/ssl/certs \
-      -u "$user" -P "$pass" -t "$topic/debug" -v
+    python3 scripts/air1-ota.py --subscribe debug
 
 # watch the combined sensor snapshot
 watch:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    topic="{{ if site_topic != "" { site_topic } else { "" } }}"
-    [ -z "$topic" ] && topic="$(grep -oP '^\s+mqtt_topic:\s*\K\S+' {{yaml}})"
-    host="$(grep -oP '^mqtt_broker:\s*\K.*' {{secrets}} | tr -d '"')"
-    user="$(grep -oP '^mqtt_username:\s*\K.*' {{secrets}} | tr -d '"')"
-    pass="$(grep -oP '^mqtt_password:\s*\K.*' {{secrets}} | tr -d '"')"
-    mosquitto_sub -h "$host" -p 8883 --capath /etc/ssl/certs \
-      -u "$user" -P "$pass" -t "$topic/state" -v
+    python3 scripts/air1-ota.py --subscribe state
 
 # FIRST-TIME USB flash — required once to get the pull-OTA agent onto the device
 install:
