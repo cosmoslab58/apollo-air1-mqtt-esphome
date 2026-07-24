@@ -127,8 +127,12 @@ def read_device_version(args, timeout=8):
     ESPHome retains entity state topics, so the `Apollo Firmware Version`
     text_sensor is readable instantly without waiting for a /state publish
     (the combined /state snapshot is deliberately not retained).
+
+    Note the `sensor/` segment: ESPHome's MQTT layer publishes text sensors
+    under the same component type as numeric ones, so the topic is
+    `sensor/apollo_firmware_version/state`, not `text_sensor/...`.
     """
-    topic = f"{args.topic}/text_sensor/apollo_firmware_version/state"
+    topic = f"{args.topic}/sensor/apollo_firmware_version/state"
     got = {"v": None}
     ev = threading.Event()
 
