@@ -128,10 +128,13 @@ harmful to breathe. It clears itself once everything is back under.
 |---|---|---|
 | CO2 | **5000 ppm** | ACGIH TLV / OSHA PEL 8-hour occupational limit |
 | AQI | **200** | EPA "Very Unhealthy"; derived from PM2.5 + PM10, so particulates are covered by this one number |
-| VOC Index | **400** | Top band of `VOC Quality` ("Extremely abnormal") |
+| VOC Index | **off** | Disabled by default — see below. Set to `400` for the top band of `VOC Quality` ("Extremely abnormal") |
 
 Tune them in the `substitutions:` at the top of `apollo-air1-mqtt.yaml`
-(`danger_co2_ppm`, `danger_aqi`, `danger_voc_index`).
+(`danger_co2_ppm`, `danger_aqi`, `danger_voc_index`). **Setting any of them to
+`0` switches that channel off** — the reading is still taken and published, it
+just stops driving the LED. The comparison folds away at compile time, so a
+disabled channel costs nothing.
 
 These sit deliberately high. 1000–2000 ppm CO2 is stuffy and measurably hurts
 concentration, but it is not dangerous, and an alarm that fires every afternoon
@@ -141,9 +144,17 @@ this is the tier above that, meant to read as *leave the room*.
 
 Notes and caveats:
 
-- **The VOC trigger is relative, not absolute.** The VOC Index is scored against
-  a ~72h learned baseline, so 400 means "something changed badly versus recent
-  normal" — smoke, solvent, off-gassing — not a calibrated toxicity level.
+- **VOC is off by default, and that depends on where the unit lives.** The VOC
+  Index is scored against a ~72h learned baseline rather than an absolute
+  concentration, so it answers "is this different from recent normal?" and not
+  "is this harmful?". Everyday domestic events — cleaning spray, deodorant, a
+  new package off-gassing — reach the top band with nothing actually wrong. In a
+  bedroom that is a light strobing at you overnight for no reason, and a
+  nuisance alarm is one you stop reading, which costs you the CO2 and AQI
+  triggers that do mean something. Somewhere solvent vapour is a genuine hazard
+  and a spike really does mean something — a workshop, garage, or lab — set
+  `danger_voc_index: "400"` and it behaves as an alarm channel like the others.
+  Either way the VOC index and `VOC Quality` are measured and published.
 - **A dead sensor does not raise the alarm.** Readings are NaN-guarded, so a
   sensor that never reports reads as "not dangerous". This is an alerting
   convenience, not a life-safety device — it is not a substitute for a CO or

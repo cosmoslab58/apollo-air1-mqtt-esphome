@@ -27,9 +27,10 @@
 #     default). On USB power the device stays awake and streams one point per
 #     minute; on battery (prevent_sleep off) it reverts to one publish per
 #     deep-sleep wake. See apollo-air1-mqtt-README.md.
-#   - Air danger alarm: the RGB LED strobes through colors while CO2 / AQI /
-#     VOC are at genuinely harmful levels (thresholds and rationale in the
-#     substitutions below). Upstream drives the LED as a continuous air-quality
+#   - Air danger alarm: the RGB LED strobes through colors while CO2, AQI or
+#     VOC is at a genuinely harmful level. Each channel has its own threshold
+#     substitution below, and setting one to 0 switches that channel off — VOC
+#     ships off. Upstream drives the LED as a continuous air-quality
 #     indicator via an "Air Quality LED Source" select; this is instead a quiet
 #     LED that only lights for an emergency. See the README.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
@@ -46,7 +47,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.6-mqtt"
+  version: "1.1.8-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -70,14 +71,26 @@ substitutions:
   #   aqi   200      : EPA "Very Unhealthy" -- health alert, everyone may
   #                    experience serious effects. Derived from PM2.5 + PM10,
   #                    so particulates are already covered by this one number.
-  #   voc   400      : top band of the VOC Quality text sensor ("Extremely
-  #                    abnormal"). The VOC Index is RELATIVE to a ~72h learned
-  #                    baseline, not an absolute concentration, so treat this as
-  #                    "something changed badly" (solvent, smoke, off-gassing)
-  #                    rather than a calibrated toxicity threshold.
+  #   voc   0        : DISABLED. Set to 400 for the top band of the VOC Quality
+  #                    text sensor ("Extremely abnormal"), or any 1-500 value.
+  #
+  # Any threshold set to 0 is off -- the clause is a compile-time constant, so a
+  # disabled channel costs nothing at runtime and the sensor is still measured
+  # and published either way. Only the LED trigger goes away.
+  #
+  # VOC ships disabled here, which is a judgement about placement rather than
+  # about the sensor. The VOC Index is RELATIVE to a ~72h learned baseline rather
+  # than an absolute concentration, so it answers "is this different from recent
+  # normal?", not "is this harmful?" -- ordinary domestic events (cleaning spray,
+  # deodorant, a freshly opened package off-gassing) reach the top band with
+  # nothing actually wrong. In the bedroom this unit sits in, that is a light
+  # strobing at you overnight, and a nuisance alarm is one you stop reading.
+  # In a workshop, garage, or lab -- somewhere solvent vapour is a real hazard
+  # and a spike genuinely means something -- set this to 400 and it works as
+  # before. CO2 and AQI stay on because both are absolute, calibrated limits.
   danger_co2_ppm: "5000"
   danger_aqi: "200"
-  danger_voc_index: "400"
+  danger_voc_index: "0"
 
 esphome:
   name: "${name}"
@@ -761,10 +774,16 @@ script:
           // must never be treated as a danger. Comparing NaN yields false
           // anyway, but being explicit keeps it obvious that a dead sensor
           // fails SAFE-looking -- see the caveat in the README.
+          //
+          // A threshold of 0 switches that channel off. The substitution is
+          // textual, so the guard folds to `0 > 0` at compile time and the rest
+          // of the clause is discarded -- a disabled channel is free, and the
+          // reading is still taken and published regardless. VOC is off by
+          // default here; see the substitutions at the top for why.
           const bool danger =
-              (!isnan(co2_ppm) && co2_ppm >= ${danger_co2_ppm}) ||
-              (!isnan(aqi_val) && aqi_val >= ${danger_aqi}) ||
-              (!isnan(voc_val) && voc_val >= ${danger_voc_index});
+              (${danger_co2_ppm} > 0 && !isnan(co2_ppm) && co2_ppm >= ${danger_co2_ppm}) ||
+              (${danger_aqi} > 0 && !isnan(aqi_val) && aqi_val >= ${danger_aqi}) ||
+              (${danger_voc_index} > 0 && !isnan(voc_val) && voc_val >= ${danger_voc_index});
 
           if (danger == id(air_danger_active)) {
             return;  // no transition, leave the strobe running or the LED off
