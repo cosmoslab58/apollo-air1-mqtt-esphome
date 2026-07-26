@@ -52,7 +52,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.11-mqtt"
+  version: "1.1.12-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -998,20 +998,43 @@ script:
             if (x <= 300)  return 4;
             return 5;
           };
-          auto band_co2 = [](float x) -> int {       // ppm, SCD40
+          // ppm, SCD40. Retuned away from upstream's 800/1000/1500/2000/2500,
+          // which paired its top band with the name "Hazardous" at 2500ppm --
+          // an ordinary closed bedroom overnight.
+          //
+          // There is NO official government severity scale for indoor CO2. EPA
+          // does not regulate it (not a criteria pollutant), and the WHO indoor
+          // air quality guidelines do not cover it. Only two ends are anchored:
+          //
+          //   800   CDC ventilation guidance for shared indoor spaces. A
+          //         ventilation-adequacy proxy, NOT a health threshold.
+          //   1100  ASHRAE comfort/odour range (~700ppm above outdoor ambient).
+          //         Also a professional-society figure, not a regulation.
+          //   5000  OSHA PEL (29 CFR 1910.1000) and NIOSH REL, 8h TWA. The one
+          //         enforceable number in the whole scale.
+          //
+          // 2000 and 3500 are interpolation between those, and are labelled in
+          // the README as judgement calls rather than guidance. The top band
+          // now coincides with the danger_co2_ppm strobe threshold instead of
+          // sitting at half of it, so "worst steady colour" means "you are at
+          // the level that trips the alarm" rather than contradicting it.
+          //
+          // Caveat that no threshold can fix: the PEL is an 8h occupational
+          // limit for healthy adult workers. This unit is in a bedroom.
+          auto band_co2 = [](float x) -> int {
             if (isnan(x)) return -1;
-            if (x <= 800)  return 0;
-            if (x <= 1000) return 1;
-            if (x <= 1500) return 2;
-            if (x <= 2000) return 3;
-            if (x <= 2500) return 4;
-            return 5;
+            if (x <= 800)  return 0;   // well ventilated
+            if (x <= 1100) return 1;   // acceptable
+            if (x <= 2000) return 2;   // stuffy
+            if (x <= 3500) return 3;   // poorly ventilated
+            if (x <= 5000) return 4;   // very poor
+            return 5;                  // occupational limit exceeded
           };
           // The two Sensirion gas indices run 1-500 and are RELATIVE to a
           // learned baseline, so they answer "different from recent normal?"
-          // rather than "harmful?". Their top band is "extremely abnormal",
-          // which is not the same claim as EPA "Hazardous" -- so both cap at
-          // band 4 and neither can ever drive the LED to band 5 on its own.
+          // rather than "harmful?". Their top rung is "extremely abnormal",
+          // which is not a severity claim at all -- so both cap at band 4 and
+          // neither can ever drive the LED to band 5 on its own.
           // VOC is centred on index_offset 100 (set in algorithm_tuning above);
           // NOx uses the driver's default offset of 1, which is why its first
           // boundary is so much lower rather than a copy-paste slip.
@@ -1098,14 +1121,20 @@ script:
             return;
           }
 
+          // Increasing severity, 0-5. Deliberately NOT named here: these were
+          // upstream's EPA AQI category names (Good ... Hazardous), which are
+          // legally defined terms for outdoor criteria pollutants and are only
+          // correct for the AQI channel. Reusing them for CO2 -- which EPA does
+          // not regulate at all -- borrowed authority that does not exist. The
+          // band table in the README labels each channel in its own terms.
           auto call = id(rgb_light).turn_on();
           switch (band) {
-            case 0: call.set_rgb(0.0f, 1.0f, 0.0f); break;   // Green  - Good
-            case 1: call.set_rgb(1.0f, 1.0f, 0.0f); break;   // Yellow - Moderate
-            case 2: call.set_rgb(1.0f, 0.5f, 0.0f); break;   // Orange - Unhealthy (Sensitive)
-            case 3: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Red    - Unhealthy
-            case 4: call.set_rgb(0.6f, 0.0f, 1.0f); break;   // Purple - Very Unhealthy
-            case 5: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Maroon - Hazardous (dimmed above)
+            case 0: call.set_rgb(0.0f, 1.0f, 0.0f); break;   // Green
+            case 1: call.set_rgb(1.0f, 1.0f, 0.0f); break;   // Yellow
+            case 2: call.set_rgb(1.0f, 0.5f, 0.0f); break;   // Orange
+            case 3: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Red
+            case 4: call.set_rgb(0.6f, 0.0f, 1.0f); break;   // Purple
+            case 5: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Red, dimmed above
           }
           call.set_brightness(level);
           // Every change eases across, worsening included -- led_pulse waits

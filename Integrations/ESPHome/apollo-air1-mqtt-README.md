@@ -135,27 +135,61 @@ the LED to one channel, which is what you want while calibrating or debugging
 that channel. Each metric is banded into severity levels sharing one colour
 table:
 
-| Band | Colour | NowCast AQI | CO2 (ppm) | VOC Index | NOx Index |
-|---|---|---|---|---|---|
-| Good | Green | ≤ 50 | ≤ 800 | < 80 | < 20 |
-| Moderate | Yellow | ≤ 100 | ≤ 1000 | < 150 | < 150 |
-| Unhealthy (sensitive) | Orange | ≤ 150 | ≤ 1500 | < 250 | < 250 |
-| Unhealthy | Red | ≤ 200 | ≤ 2000 | < 400 | < 400 |
-| Very unhealthy | Purple | ≤ 300 | ≤ 2500 | ≥ 400 | ≥ 400 |
-| Hazardous | Dim red | > 300 | > 2500 | — | — |
+| Colour | NowCast AQI | CO2 (ppm) | VOC Index | NOx Index |
+|---|---|---|---|---|
+| Green | ≤ 50 — Good | ≤ 800 — Well ventilated | < 80 | < 20 |
+| Yellow | ≤ 100 — Moderate | ≤ 1100 — Acceptable | < 150 | < 150 |
+| Orange | ≤ 150 — Unhealthy (sensitive) | ≤ 2000 — Stuffy | < 250 | < 250 |
+| Red | ≤ 200 — Unhealthy | ≤ 3500 — Poorly ventilated | < 400 | < 400 |
+| Purple | ≤ 300 — Very unhealthy | ≤ 5000 — Very poor | ≥ 400 | ≥ 400 |
+| Dim red | > 300 — Hazardous | > 5000 — Occupational limit | — | — |
 
-The two Sensirion gas indices cap at *Very unhealthy*. They are relative to a
-learned ~72 h baseline, so they measure "different from recent normal", not
-"harmful" — which is not a claim that justifies the top band. Only the two
-absolute, calibrated scales can drive the LED to *Hazardous*. Their band edges
-differ because VOC is centred on an index offset of 100 while NOx uses the
-driver default of 1.
+**Each channel is labelled in its own terms, deliberately.** Upstream applied
+the EPA AQI category names (*Good* … *Hazardous*) across every column. Those are
+legally defined terms for outdoor criteria pollutants: they are correct for the
+AQI column and borrowed authority everywhere else. EPA does not regulate indoor
+CO2 at all — it is not a criteria pollutant — so calling 2500 ppm "Hazardous",
+as upstream did, was both unfounded and wrong on the facts. 2500 ppm is an
+ordinary closed bedroom overnight.
 
-*Hazardous* is rendered as a dimmed red rather than a true maroon. ESPHome
+### Where the CO2 numbers come from
+
+There is **no official government severity scale for indoor CO2.** Not from EPA,
+not from CDC, not from WHO (whose indoor air guidelines cover benzene, CO,
+formaldehyde, NO2 and radon among others, but not CO2). Only the ends of this
+scale are anchored:
+
+| ppm | Source | What it actually is |
+|---|---|---|
+| 800 | CDC ventilation guidance | Ventilation-adequacy proxy, **not** a health threshold |
+| 1100 | ASHRAE comfort/odour range | Professional society, ~700 ppm over outdoor ambient |
+| 5000 | **OSHA PEL** (29 CFR 1910.1000), NIOSH REL | 8 h TWA — the one enforceable number here |
+
+`2000` and `3500` are interpolation between those anchors. They are a reasonable
+curve, not guidance, and are not presented as anything more.
+
+Two caveats worth keeping in view. ASHRAE 62.1 deliberately sets no CO2 limit —
+it treats CO2 as a proxy for whether enough outdoor air is arriving, not as a
+toxin. And the OSHA PEL is an 8-hour occupational limit for **healthy adult
+workers**; a bedroom, occupied eight hours a night indefinitely and possibly by
+children, is not the population or the exposure pattern it was written for. It is
+the best-defined number available, not a bedroom-appropriate one.
+
+The top CO2 band now coincides exactly with the `danger_co2_ppm` strobe
+threshold rather than sitting at half of it, so the worst steady colour means
+"you are at the level that trips the alarm" instead of contradicting it.
+
+The two Sensirion gas indices carry no category words at all and cap at purple.
+They score against a learned ~72 h baseline, so they measure "different from
+recent normal", not "harmful" — which is not a severity claim, and certainly not
+one that earns a top band. Their band edges differ from each other because VOC is
+centred on an index offset of 100 while NOx uses the driver default of 1.
+
+The top band is rendered as a dimmed red rather than a true maroon. ESPHome
 normalises every light call so the brightest RGB channel becomes 1.0, so a
 "dark red" `set_rgb(0.5, 0, 0)` is rescaled straight back to pure red and is
-indistinguishable from the *Unhealthy* band — brightness is the only axis that
-survives normalisation.
+indistinguishable from the red band — brightness is the only axis that survives
+normalisation.
 
 A metric that has not produced a reading yet (NaN) does not vote. Under `All` a
 warming-up SCD40 or a post-reset VOC baseline can neither hold the colour at
