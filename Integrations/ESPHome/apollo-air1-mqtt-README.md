@@ -118,6 +118,46 @@ with its default `esphome/apollo-air-1`.
   the device with `mosquitto_sub -t '<topic>/#' -v`; not needed for the normal
   data path. Home Assistant MQTT discovery is deliberately off (`discovery: false`).
 
+## Air quality LED
+
+The steady RGB colour from the stock firmware, ported from upstream `Core.yaml`
+unchanged. Two config entities drive it:
+
+| Entity | Values | Default |
+|---|---|---|
+| `Air Quality LED Source` | `Off`, `NowCast AQI`, `CO2`, `VOC Index` | `Off` |
+| `Air Quality LED Brightness` | 5–100 % | 100 |
+
+The selected metric is banded into six severity levels sharing one colour table:
+
+| Band | Colour | NowCast AQI | CO2 (ppm) | VOC Index |
+|---|---|---|---|---|
+| Good | Green | ≤ 50 | ≤ 800 | < 80 |
+| Moderate | Yellow | ≤ 100 | ≤ 1000 | < 150 |
+| Unhealthy (sensitive) | Orange | ≤ 150 | ≤ 1500 | < 250 |
+| Unhealthy | Red | ≤ 200 | ≤ 2000 | < 400 |
+| Very unhealthy | Purple | ≤ 300 | ≤ 2500 | ≥ 400 |
+| Hazardous | Maroon | > 300 | > 2500 | — |
+
+A metric that has not produced a reading yet (NaN) turns the LED off rather than
+showing a stale colour, so a missing module reads as dark, not as "Good".
+
+### How it interacts with the air danger alarm
+
+The alarm below outranks this. While it is active the strobe owns the LED and
+the steady colour is suppressed; when the air clears, the band colour is
+restored rather than the LED simply going dark. The boot self-test and the
+button-press status flash also take priority for the few seconds they run.
+
+Two guards are inherited from upstream and matter if you edit this: the LED is
+not written in the first 5 s after boot (the select's `restore_value` fires
+`on_value` before the LED strip is initialised, which faults), and repaints are
+skipped while `statusCheck` or `testScript` is running.
+
+> Note: `restore_value: true` means the source survives reboots. After first
+> flashing this change the restored value may not be `Off` — check the entity
+> and set it deliberately.
+
 ## Air danger alarm
 
 The RGB LED strobes through saturated colors (red → white → blue → amber →
