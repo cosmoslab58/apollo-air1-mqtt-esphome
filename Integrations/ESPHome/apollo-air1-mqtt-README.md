@@ -125,7 +125,7 @@ combined `All` mode. Two config entities drive it:
 
 | Entity | Values | Default |
 |---|---|---|
-| `Air Quality LED Source` | `Off`, `All`, `NowCast AQI`, `CO2`, `VOC Index`, `NOx Index` | `All` |
+| `Air Quality LED Source` | `Off`, `All`, `PM AQI`, `CO2`, `VOC Index`, `NOx Index` | `All` |
 | `LED Brightness` | 0–100 % (0 = off) | 100 |
 
 `All` is the local addition and the default: it colours the LED by the **worst**
@@ -135,7 +135,7 @@ the LED to one channel, which is what you want while calibrating or debugging
 that channel. Each metric is banded into severity levels sharing one colour
 table:
 
-| Colour | NowCast AQI | CO2 (ppm) | VOC Index | NOx Index |
+| Colour | PM AQI | CO2 (ppm) | VOC Index | NOx Index |
 |---|---|---|---|---|
 | Green | ≤ 50 — Good | ≤ 800 — Well ventilated | < 80 | < 20 |
 | Yellow | ≤ 100 — Moderate | ≤ 1100 — Acceptable | < 150 | < 150 |
@@ -151,6 +151,29 @@ AQI column and borrowed authority everywhere else. EPA does not regulate indoor
 CO2 at all — it is not a criteria pollutant — so calling 2500 ppm "Hazardous",
 as upstream did, was both unfounded and wrong on the facts. 2500 ppm is an
 ordinary closed bedroom overnight.
+
+### Why it is "PM AQI" and not "NowCast AQI"
+
+Upstream names this sensor *NowCast AQI*. It does not compute NowCast.
+
+ESPHome's `aqi` component takes the **current** PM2.5 and PM10 readings, runs
+each through the EPA breakpoint table with linear interpolation, and publishes
+the higher of the two (`aqi_calculator.h`). It keeps no history whatsoever.
+
+EPA's **NowCast** is a different algorithm: a weighted average over the previous
+**12 hours** of PM, where the weight factor is derived from the ratio of minimum
+to maximum concentration in that window. It exists so AirNow can report something
+comparable to the 24-hour-averaged AQI in near-real-time while damping short
+spikes. A component with no buffer structurally cannot implement it.
+
+*PM* is the other half of the name and earns its place: a real EPA AQI is the
+maximum across PM2.5, PM10, ozone, NO2, SO2 and CO. This device measures only the
+two particulate channels, so on a high-ozone day the true outdoor AQI is higher
+than this figure and nothing here would know. Read it as "the PM-driven portion
+of an AQI", not as an AQI.
+
+The breakpoints themselves are current: the first PM2.5 boundary is 9.1 µg/m³,
+the 2024 revised NAAQS, not the superseded 12.1.
 
 ### Where the CO2 numbers come from
 
@@ -250,6 +273,11 @@ skipped while `statusCheck` or `testScript` is running.
 > | `NowCast AQI` | 1 | `All` |
 > | `CO2` | 2 | `NowCast AQI` |
 > | `VOC Index` | 3 | `CO2` |
+>
+> The names above are the ones in force at the time of that upgrade. `NowCast
+> AQI` was later renamed to `PM AQI` **in place**, keeping index 2, so that
+> rename was safe for deployed units — renaming an option is fine, inserting or
+> reordering one is not.
 >
 > Check the entity after any OTA that touches this list, and set it explicitly:
 >

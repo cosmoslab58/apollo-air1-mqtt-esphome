@@ -36,7 +36,7 @@
 #     lights for an emergency. See the README.
 #   - Combined air-quality LED: the "Air Quality LED Source" select gains an
 #     "All" option (the new default), which colours the LED by the WORST band
-#     across NowCast AQI, CO2, VOC and NOx instead of one chosen metric. The
+#     across PM AQI, CO2, VOC and NOx instead of one chosen metric. The
 #     LED repaints on every sensor reading rather than once per publish.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
@@ -52,7 +52,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.12-mqtt"
+  version: "1.1.13-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -319,7 +319,9 @@ select:
     # "NowCast AQI" (old index 1) came back as "All", and one set to "CO2" (old
     # index 2) came back as "NowCast AQI". Append new options at the END unless
     # you intend that remap, and check the unit after an OTA either way.
-    options: ["Off", "All", "NowCast AQI", "CO2", "VOC Index", "NOx Index"]
+    # "NowCast AQI" was renamed to "PM AQI" IN PLACE, keeping index 2, so that
+    # rename is safe for deployed units -- unlike the insertion above.
+    options: ["Off", "All", "PM AQI", "CO2", "VOC Index", "NOx Index"]
     # Only applies to a factory-reset or newly flashed device; a deployed unit
     # restores its stored index instead.
     initial_option: "All"
@@ -617,9 +619,26 @@ sensor:
     icon: mdi:air-filter
     update_interval: 10s
 
+  # Named "PM AQI", not "NowCast AQI" as upstream has it. This component takes
+  # the CURRENT pm_2_5/pm_10_0 values, runs each through the EPA breakpoint
+  # table with linear interpolation, and publishes the max -- see
+  # aqi_calculator.h. It keeps no history at all.
+  #
+  # NowCast is a different algorithm entirely: a weighted average over the
+  # previous 12 HOURS of PM, with the weight derived from the min/max ratio in
+  # that window. EPA built it so AirNow could report something comparable to the
+  # 24h-averaged AQI in near-real-time while damping spikes. This component
+  # structurally cannot be that -- there is no buffer to average over.
+  #
+  # "PM" also earns its place: a real EPA AQI is the max across PM2.5, PM10,
+  # ozone, NO2, SO2 and CO. This device measures only the two particulate
+  # channels, so on a bad ozone day the true outdoor AQI is higher than this
+  # number and nothing here would know. (The breakpoints themselves are current
+  # -- the first PM2.5 boundary is 9.1, the 2024 revised NAAQS, not the old
+  # 12.1.)
   - platform: aqi
-    name: "NowCast AQI"
-    id: nowcast_aqi
+    name: "PM AQI"
+    id: pm_aqi
     pm_2_5: pm_2_5
     pm_10_0: pm_10_0
     calculation_type: AQI
@@ -905,7 +924,7 @@ script:
           }
 
           const float co2_ppm = id(co2).state;
-          const float aqi_val = id(nowcast_aqi).state;
+          const float aqi_val = id(pm_aqi).state;
           const float voc_val = id(sen55_voc).state;
           // NaN-guarded: a sensor that has not produced a reading yet (SCD40
           // needs a warm-up, and NOx/VOC start as NaN after a baseline reset)
@@ -1068,10 +1087,10 @@ script:
             // returns -1 and simply does not vote: a warming-up SCD40 or a
             // post-reset VOC baseline can neither pin the colour at green nor
             // invent a red.
-            band = std::max(std::max(band_aqi(id(nowcast_aqi).state), band_co2(id(co2).state)),
+            band = std::max(std::max(band_aqi(id(pm_aqi).state), band_co2(id(co2).state)),
                             std::max(band_voc(id(sen55_voc).state), band_nox(id(sen55_nox).state)));
           } else if (src == "NowCast AQI") {
-            band = band_aqi(id(nowcast_aqi).state);
+            band = band_aqi(id(pm_aqi).state);
           } else if (src == "CO2") {
             band = band_co2(id(co2).state);
           } else if (src == "VOC Index") {
@@ -1299,7 +1318,7 @@ script:
             root["voc_index"] = id(sen55_voc).state;
             root["nox_index"] = id(sen55_nox).state;
             root["voc_quality"] = id(voc_quality).state;
-            root["aqi"] = id(nowcast_aqi).state;
+            root["aqi"] = id(pm_aqi).state;
             root["wifi_rssi_db"] = id(wifi_signal_db).state;
             root["esp_temperature_c"] = id(sys_esp_temperature).state;
             root["uptime_s"] = id(sys_uptime).state;
