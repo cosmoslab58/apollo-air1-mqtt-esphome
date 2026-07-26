@@ -253,9 +253,25 @@ would be dimming a colour that no longer means what it was announcing.
 ### How it interacts with the air danger alarm
 
 The alarm below outranks this. While it is active the strobe owns the LED and
-the steady colour is suppressed; when the air clears, the band colour is
+the steady color is suppressed; when the air clears, the band color is
 restored rather than the LED simply going dark. The boot self-test and the
 button-press status flash also take priority for the few seconds they run.
+
+What happens *between* alarms is a choice, made by two switches:
+
+| `LED Alarm Mode` | `LED Steady In Alarm Mode` | Between alarms | At danger |
+|---|---|---|---|
+| Off | (ignored) | Steady band color | Steady band color — no strobe |
+| **On** (default) | **Off** (default) | Dark | Strobe |
+| On | On | Steady band color | Strobe, over the color |
+
+The default pairing is the quiet one, and it is the default for a reason: a dark
+LED makes the strobe unmissable, and makes *dark itself* mean "nothing is
+wrong". Turning on `LED Steady In Alarm Mode` trades that away for a light that
+reports the band all the time — you can read the air without opening anything,
+but you no longer get the answer from across the room without looking at which
+color it is. Nothing else moves: the strobe keeps its own thresholds, its
+hardcoded 100%, and its priority over the color.
 
 Two guards are inherited from upstream and matter if you edit this: the LED is
 not written in the first 5 s after boot (the select's `restore_value` fires
@@ -328,11 +344,14 @@ Notes and caveats:
   sensor that never reports reads as "not dangerous". This is an alerting
   convenience, not a life-safety device — it is not a substitute for a CO or
   smoke alarm, neither of which this hardware can detect at all.
-- **The strobe always runs at 100%, and `LED Brightness` is inert in alarm
-  mode** — not even `0` silences it. An alarm a stray slider drag can dim to
-  invisibility is not an alarm. The slider applies only to the steady indicator
-  colour. (ESPHome template numbers cannot be greyed out at runtime, so the
-  slider stays movable while alarm mode is on; it simply has no effect.)
+- **The strobe always runs at 100%, and `LED Brightness` never touches it** —
+  not even `0` silences it. An alarm a stray slider drag can dim to invisibility
+  is not an alarm. The slider applies only to the steady indicator color, which
+  means it does nothing whatsoever in the default alarm-only pairing (there is
+  no steady color to scale) and works normally again once `LED Steady In Alarm
+  Mode` gives it one. (ESPHome template numbers cannot be greyed out at runtime,
+  so the slider stays movable either way; it simply has no effect in the mode
+  with no color of its own.)
 - **It is a mains-powered feature in practice.** Evaluation happens on every
   air-quality reading, so on USB power that is roughly every 10 seconds. On
   battery the device is asleep (and the LED dark) for most of each 5-minute

@@ -33,7 +33,9 @@
 #     ships off. The strobe always runs at 100% and ignores the LED Brightness
 #     slider. Upstream drives the LED as a continuous air-quality indicator via
 #     an "Air Quality LED Source" select; this is instead a quiet LED that only
-#     lights for an emergency. See the README.
+#     lights for an emergency — unless "LED Steady In Alarm Mode" is on, which
+#     runs both: the steady color between alarms, the strobe on top of it at
+#     danger. See the README.
 #   - Combined air-quality LED: the "Air Quality LED Source" select gains an
 #     "All" option (the new default), which colours the LED by the WORST band
 #     across PM AQI, CO2, VOC and NOx instead of one chosen metric. The
@@ -52,7 +54,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.13-mqtt"
+  version: "1.1.14-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -342,12 +344,15 @@ number:
     # master off. There is deliberately no separate enable switch -- one
     # control that can reach zero beats two that can disagree.
     #
-    # STEADY MODE ONLY. This slider has no effect while LED Alarm Mode is on --
-    # not even at 0. An alarm that a stray slider drag can dim to invisibility
-    # is not an alarm, so the strobe is hardcoded to 100% and ignores this
-    # control entirely. ESPHome template numbers cannot be greyed out at
-    # runtime, so the slider stays movable in alarm mode; it just does nothing
-    # until you switch back to indicator mode.
+    # STEADY COLOR ONLY. The strobe is hardcoded to 100% and ignores this
+    # control entirely -- an alarm that a stray slider drag can dim to
+    # invisibility is not an alarm. So this does nothing at all while LED Alarm
+    # Mode is on WITHOUT LED Steady In Alarm Mode: there is no steady color to
+    # scale, and not even 0 changes anything. Turn the steady color back on
+    # under the alarm and the slider matters again, for the color only.
+    # ESPHome template numbers cannot be greyed out at runtime, so the slider
+    # stays movable either way; it just does nothing in the mode that has no
+    # color of its own.
     min_value: 0
     max_value: 100
     step: 1
@@ -778,18 +783,44 @@ text_sensor:
     entity_category: "diagnostic"
 
 switch:
-  # Which of the two behaviours the LED runs. ON  = alarm only: dark until a
-  # reading crosses a danger threshold, then the strobe, always at 100% with the
-  # LED Brightness slider inert. OFF = steady air-quality colour from Air
-  # Quality LED Source at the slider's brightness, and no strobe. They are
-  # deliberately exclusive -- running both means the steady colour is really
-  # just "the alarm is not firing", which is not worth an LED.
+  # Whether the danger strobe is armed at all. ON = the LED can strobe when a
+  # reading crosses a danger threshold, always at 100% with the LED Brightness
+  # slider inert. OFF = steady air-quality color from Air Quality LED Source at
+  # the slider's brightness, and no strobe ever.
+  #
+  # What the LED does BETWEEN alarms is the next switch's business, not this
+  # one's. On its own this still means "dark until something is wrong", which is
+  # the default and the reason the alarm reads unambiguously.
   - platform: template
     name: "LED Alarm Mode"
     id: led_alarm_mode
     icon: mdi:alarm-light
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    entity_category: "config"
+    on_turn_on:
+      - script.execute: apply_led_state
+    on_turn_off:
+      - script.execute: apply_led_state
+
+  # Modifier for the switch above, and inert without it. ON = keep painting the
+  # steady air-quality color between alarms, so the LED reports the band all the
+  # time and the strobe still outranks it at danger. OFF (the default, and the
+  # original behaviour) = dark between alarms.
+  #
+  # The trade is real in both directions, which is why it is a choice and not a
+  # fix: a dark LED makes the strobe unmissable and makes "dark" itself mean
+  # "nothing is wrong", while a lit one costs that at-a-glance reading but tells
+  # you the band without opening anything. Nothing else changes -- the strobe
+  # keeps its own thresholds, its hardcoded 100%, and its priority over the
+  # color. The Brightness slider goes back to doing something in this mode,
+  # since there is once again a steady color for it to scale.
+  - platform: template
+    name: "LED Steady In Alarm Mode"
+    id: led_steady_in_alarm
+    icon: mdi:television-ambient-light
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
     entity_category: "config"
     on_turn_on:
       - script.execute: apply_led_state
@@ -1075,11 +1106,14 @@ script:
           };
 
           // Master switch, and mode, folded into the head of the same chain so
-          // there is exactly one place that decides the band. In alarm mode the
-          // steady colour is not drawn at all -- the LED is dark unless the
+          // there is exactly one place that decides the band. Alarm mode alone
+          // does not draw the steady color at all -- the LED is dark unless the
           // strobe is running, which is what makes "dark" mean "nothing is
-          // wrong" at a glance.
-          if (level <= 0.0f || id(led_alarm_mode).state || src == "Off") {
+          // wrong" at a glance. LED Steady In Alarm Mode buys that back: the
+          // color is painted as usual between alarms, and airDangerCheck's
+          // air_danger_active guard above still keeps the strobe on top.
+          if (level <= 0.0f || src == "Off" ||
+              (id(led_alarm_mode).state && !id(led_steady_in_alarm).state)) {
             band = -1;
           } else if (src == "All") {
             // Worst-of across every air-quality channel the device has, so a
