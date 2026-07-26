@@ -257,21 +257,25 @@ the steady color is suppressed; when the air clears, the band color is
 restored rather than the LED simply going dark. The boot self-test and the
 button-press status flash also take priority for the few seconds they run.
 
-What happens *between* alarms is a choice, made by two switches:
+The two controls are independent, and compose into everything worth having:
 
-| `LED Alarm Mode` | `LED Steady In Alarm Mode` | Between alarms | At danger |
+| `LED Alarm Mode` | `LED Brightness` | Between alarms | At danger |
 |---|---|---|---|
-| Off | (ignored) | Steady band color | Steady band color — no strobe |
-| **On** (default) | **Off** (default) | Dark | Strobe |
-| On | On | Steady band color | Strobe, over the color |
+| On | **0** | Dark | Strobe |
+| On | 1–100 % | Steady band color | Strobe, over the color |
+| Off | 0 | Dark | Dark — LED fully off |
+| Off | 1–100 % | Steady band color | Steady band color, no strobe |
 
-The default pairing is the quiet one, and it is the default for a reason: a dark
-LED makes the strobe unmissable, and makes *dark itself* mean "nothing is
-wrong". Turning on `LED Steady In Alarm Mode` trades that away for a light that
-reports the band all the time — you can read the air without opening anything,
-but you no longer get the answer from across the room without looking at which
-color it is. Nothing else moves: the strobe keeps its own thresholds, its
-hardcoded 100%, and its priority over the color.
+`LED Alarm Mode` decides only whether the strobe is armed; the slider decides
+only what the LED does the rest of the time. Nothing suppresses anything — the
+strobe outranks the steady color through the `air_danger_active` guard, so the
+color painter never needs to know the mode.
+
+Row one is the quiet setup the alarm was designed around: a dark LED makes the
+strobe unmissable and makes *dark itself* mean "nothing is wrong". Row two
+trades that for a light that reports the band all the time — you can read the
+air without opening anything, but you no longer get the answer from across the
+room without looking at which color it is.
 
 Two guards are inherited from upstream and matter if you edit this: the LED is
 not written in the first 5 s after boot (the select's `restore_value` fires
@@ -347,11 +351,8 @@ Notes and caveats:
 - **The strobe always runs at 100%, and `LED Brightness` never touches it** —
   not even `0` silences it. An alarm a stray slider drag can dim to invisibility
   is not an alarm. The slider applies only to the steady indicator color, which
-  means it does nothing whatsoever in the default alarm-only pairing (there is
-  no steady color to scale) and works normally again once `LED Steady In Alarm
-  Mode` gives it one. (ESPHome template numbers cannot be greyed out at runtime,
-  so the slider stays movable either way; it simply has no effect in the mode
-  with no color of its own.)
+  is exactly why `0` is the way to ask for a dark-between-alarms LED: it takes
+  the indicator away and leaves the alarm at full strength.
 - **It is a mains-powered feature in practice.** Evaluation happens on every
   air-quality reading, so on USB power that is roughly every 10 seconds. On
   battery the device is asleep (and the LED dark) for most of each 5-minute
