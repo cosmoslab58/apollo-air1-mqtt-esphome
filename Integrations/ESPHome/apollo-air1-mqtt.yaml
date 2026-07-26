@@ -312,10 +312,16 @@ select:
     optimistic: true
     restore_value: true
     entity_category: "config"
+    # WARNING: restore_value persists the option's INDEX, not its name (see
+    # template_select.cpp setup_with_restore). Inserting or reordering an option
+    # therefore silently reassigns what every already-deployed unit restores to.
+    # Adding "All" at index 1 shifted this list by one, so a device last set to
+    # "NowCast AQI" (old index 1) came back as "All", and one set to "CO2" (old
+    # index 2) came back as "NowCast AQI". Append new options at the END unless
+    # you intend that remap, and check the unit after an OTA either way.
     options: ["Off", "All", "NowCast AQI", "CO2", "VOC Index", "NOx Index"]
-    # restore_value keeps whatever the unit was last set to, so changing this
-    # only affects a factory-reset or newly flashed device. An already-deployed
-    # unit needs an explicit publish to the select's command topic.
+    # Only applies to a factory-reset or newly flashed device; a deployed unit
+    # restores its stored index instead.
     initial_option: "All"
     on_value:
       then:

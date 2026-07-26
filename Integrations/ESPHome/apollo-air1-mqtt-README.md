@@ -205,14 +205,25 @@ not written in the first 5 s after boot (the select's `restore_value` fires
 `on_value` before the LED strip is initialised, which faults), and repaints are
 skipped while `statusCheck` or `testScript` is running.
 
-> Note: `restore_value: true` means the source survives reboots, so the `All`
-> default only applies to a newly flashed or factory-reset unit. An already
-> deployed device keeps whatever it was last set to — check the entity and set
-> it deliberately:
+> **`restore_value` persists the option's index, not its name.** The `All`
+> default therefore only applies to a newly flashed or factory-reset unit, and —
+> more surprisingly — inserting `All` at position 1 shifted the whole list, so
+> deployed units came back pointing at a *different* option than before:
+>
+> | Was set to | Old index | Restores as |
+> |---|---|---|
+> | `Off` | 0 | `Off` |
+> | `NowCast AQI` | 1 | `All` |
+> | `CO2` | 2 | `NowCast AQI` |
+> | `VOC Index` | 3 | `CO2` |
+>
+> Check the entity after any OTA that touches this list, and set it explicitly:
 >
 > ```bash
 > mosquitto_pub -t '<topic>/select/air_quality_led_source/command' -m 'All'
 > ```
+>
+> Append new options at the end unless you actually want that remap.
 
 ## Air danger alarm
 
