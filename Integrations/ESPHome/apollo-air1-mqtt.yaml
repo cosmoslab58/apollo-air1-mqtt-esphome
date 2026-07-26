@@ -47,7 +47,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.8-mqtt"
+  version: "1.1.9-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -274,7 +274,44 @@ interval:
           then:
             - script.execute: reportAllValues
 
+# Stock air-quality LED. Upstream Core.yaml drives rgb_light from one selected
+# metric, banded into six severity colors. Ships "Off", so the LED stays dark
+# until a source is picked -- same default as the factory firmware.
+#
+# This is independent of the Air Danger strobe: the strobe overrides the steady
+# color while the air is genuinely unsafe, and the color is restored when it
+# clears. See update_air_quality_led.
+select:
+  - platform: template
+    name: "Air Quality LED Source"
+    id: air_quality_led_source
+    icon: mdi:led-on
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    options: ["Off", "NowCast AQI", "CO2", "VOC Index"]
+    initial_option: "Off"
+    on_value:
+      then:
+        - script.execute: update_air_quality_led
+
 number:
+  - platform: template
+    name: "Air Quality LED Brightness"
+    id: air_quality_led_brightness
+    icon: mdi:brightness-6
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 100
+    step: 1
+    initial_value: 100
+    mode: slider
+    on_value:
+      then:
+        - script.execute: update_air_quality_led
   - platform: template
     name: "SEN55 Temperature Offset"
     id: sen55_temperature_offset
@@ -392,6 +429,12 @@ sensor:
     co2:
       name: "CO2"
       id: "co2"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return id(air_quality_led_source).current_option() == "CO2";'
+            then:
+              - script.execute: update_air_quality_led
     # OFF deliberately, and unlike upstream there is no runtime switch for it.
     # ASC re-baselines by treating the lowest CO2 seen over a multi-day window
     # as fresh outdoor air (~400ppm). That assumption holds for a sensor that
@@ -455,6 +498,12 @@ sensor:
     voc:
       name: "SEN55 VOC"
       id: sen55_voc
+      on_value:
+        - if:
+            condition:
+              lambda: 'return id(air_quality_led_source).current_option() == "VOC Index";'
+            then:
+              - script.execute: update_air_quality_led
       algorithm_tuning:
         # https://sensirion.com/media/documents/25AB572C/62B463AA/Sensirion_Engineering_Guidelines_SEN5x.pdf
         index_offset: 100
@@ -524,6 +573,12 @@ sensor:
     pm_10_0: pm_10_0
     calculation_type: AQI
     device_class: aqi
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(air_quality_led_source).current_option() == "NowCast AQI";'
+          then:
+            - script.execute: update_air_quality_led
 
 light:
   - platform: esp32_rmt_led_strip
@@ -799,7 +854,97 @@ script:
             ESP_LOGI("Apollo", "Air back within safe limits -- alarm OFF");
             auto call = id(rgb_light).turn_off();
             call.perform();
+            // Hand the LED back to the steady air-quality colour. That script
+            // turns it off by itself when the source is "Off", so this stays
+            // dark for anyone who has not enabled the feature.
+            id(restore_air_quality_led).execute();
           }
+
+  # Stock behaviour, ported from upstream Core.yaml. Paints rgb_light with the
+  # severity band of whichever metric air_quality_led_source names.
+  - id: update_air_quality_led
+    then:
+      - lambda: |-
+          // The select's restore_value publishes during component setup and
+          // fires on_value before rgb_light (esp32_rmt_led_strip) is
+          // initialised; touching the light then faults in schedule_show().
+          if (millis() < 5000) {
+            return;
+          }
+
+          // statusCheck (boot/button status flash) and testScript own the LED
+          // while they run; don't repaint underneath them.
+          if (id(statusCheck).is_running() || id(testScript).is_running()) {
+            return;
+          }
+
+          // Local addition, not in upstream: this firmware also has the Air
+          // Danger strobe, which must outrank a steady status colour. While the
+          // alarm is up, leave it alone -- airDangerCheck calls this script
+          // again once the air clears, which repaints the correct band.
+          if (id(air_danger_active)) {
+            return;
+          }
+
+          const std::string src = id(air_quality_led_source).current_option();
+
+          if (src == "Off") {
+            id(rgb_light).turn_off().perform();
+            return;
+          }
+
+          // Map the selected metric to a severity band: 0=Good ... 5=Hazardous.
+          // Each metric has its own scale; bands share one colour table below.
+          int band = -1;
+          if (src == "NowCast AQI") {                // US EPA AQI
+            const float x = id(nowcast_aqi).state;
+            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
+            if      (x <= 50)   band = 0;
+            else if (x <= 100)  band = 1;
+            else if (x <= 150)  band = 2;
+            else if (x <= 200)  band = 3;
+            else if (x <= 300)  band = 4;
+            else                band = 5;
+          } else if (src == "CO2") {                 // ppm, SCD40
+            const float x = id(co2).state;
+            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
+            if      (x <= 800)  band = 0;
+            else if (x <= 1000) band = 1;
+            else if (x <= 1500) band = 2;
+            else if (x <= 2000) band = 3;
+            else if (x <= 2500) band = 4;
+            else                band = 5;
+          } else if (src == "VOC Index") {           // Sensirion VOC index
+            const float x = id(sen55_voc).state;
+            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
+            if      (x < 80)    band = 0;
+            else if (x < 150)   band = 1;
+            else if (x < 250)   band = 2;
+            else if (x < 400)   band = 3;
+            else                band = 4;            // VOC tops out at "extremely abnormal"
+          }
+          if (band < 0) return;
+
+          auto call = id(rgb_light).turn_on();
+          call.set_brightness(id(air_quality_led_brightness).state / 100.0f);
+          switch (band) {
+            case 0: call.set_rgb(0.0f, 1.0f, 0.0f); break;   // Green  - Good
+            case 1: call.set_rgb(1.0f, 1.0f, 0.0f); break;   // Yellow - Moderate
+            case 2: call.set_rgb(1.0f, 0.5f, 0.0f); break;   // Orange - Unhealthy (Sensitive)
+            case 3: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Red    - Unhealthy
+            case 4: call.set_rgb(0.6f, 0.0f, 1.0f); break;   // Purple - Very Unhealthy
+            case 5: call.set_rgb(0.5f, 0.0f, 0.0f); break;   // Maroon - Hazardous
+          }
+          call.perform();
+
+  # Short delay so the caller's own light action lands first and
+  # update_air_quality_led's is_running() guard passes. mode: restart so a
+  # burst of callers collapses into one repaint.
+  - id: restore_air_quality_led
+    mode: restart
+    then:
+      - delay: 200ms
+      - script.execute: update_air_quality_led
 
   - id: statusCheck
     then:
@@ -835,7 +980,9 @@ script:
                       green: 100%
                       blue: 0%
       - delay: 5s
-      - light.turn_off: rgb_light
+      # Upstream turns the LED off here; hand back to the air-quality
+      # colour instead, which is a no-op when the source is "Off".
+      - script.execute: restore_air_quality_led
 
   - id: reportAllValues
     then:
