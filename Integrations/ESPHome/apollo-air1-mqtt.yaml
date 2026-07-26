@@ -47,7 +47,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.9-mqtt"
+  version: "1.1.10-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -297,21 +297,24 @@ select:
 
 number:
   - platform: template
-    name: "Air Quality LED Brightness"
+    name: "LED Brightness"
     id: air_quality_led_brightness
     icon: mdi:brightness-6
     optimistic: true
     restore_value: true
     entity_category: "config"
     unit_of_measurement: "%"
-    min_value: 5
+    # Upstream's floor is 5; 0 is allowed here so the slider doubles as the
+    # master off. There is deliberately no separate enable switch -- one
+    # control that can reach zero beats two that can disagree.
+    min_value: 0
     max_value: 100
     step: 1
     initial_value: 100
     mode: slider
     on_value:
       then:
-        - script.execute: update_air_quality_led
+        - script.execute: apply_led_state
   - platform: template
     name: "SEN55 Temperature Offset"
     id: sen55_temperature_offset
@@ -712,6 +715,23 @@ text_sensor:
     entity_category: "diagnostic"
 
 switch:
+  # Which of the two behaviours the LED runs. ON  = alarm only: dark until a
+  # reading crosses a danger threshold, then the strobe. OFF = steady
+  # air-quality colour from Air Quality LED Source, and no strobe. They are
+  # deliberately exclusive -- running both means the steady colour is really
+  # just "the alarm is not firing", which is not worth an LED.
+  - platform: template
+    name: "LED Alarm Mode"
+    id: led_alarm_mode
+    icon: mdi:alarm-light
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: "config"
+    on_turn_on:
+      - script.execute: apply_led_state
+    on_turn_off:
+      - script.execute: apply_led_state
+
   - platform: factory_reset
     id: factory_reset_switch
     internal: true
@@ -821,6 +841,18 @@ script:
           // Do NOT name these after entity ids -- id(co2) generates `co2->state`,
           // so a local called `co2` shadows the entity pointer and fails to
           // compile with "base operand of '->' is not a pointer".
+          // Master switch and mode gate the alarm. If it was firing when the
+          // mode changed, drop it and hand the LED back to the steady colour,
+          // which turns it off by itself when disabled or set to "Off".
+          if (id(air_quality_led_brightness).state <= 0.0f || !id(led_alarm_mode).state) {
+            if (id(air_danger_active)) {
+              id(air_danger_active) = false;
+              id(rgb_light).turn_off().perform();
+              id(restore_air_quality_led).execute();
+            }
+            return;
+          }
+
           const float co2_ppm = id(co2).state;
           const float aqi_val = id(nowcast_aqi).state;
           const float voc_val = id(sen55_voc).state;
@@ -848,6 +880,10 @@ script:
           if (danger) {
             ESP_LOGW("Apollo", "AIR DANGER: co2=%.0fppm aqi=%.0f voc=%.0f -- alarm ON", co2_ppm, aqi_val, voc_val);
             auto call = id(rgb_light).turn_on();
+            // The strobe's own colours are defined at 100%; the light's master
+            // brightness scales them, so the slider dims the alarm as well as
+            // the steady colour rather than only one of the two.
+            call.set_brightness(id(air_quality_led_brightness).state / 100.0f);
             call.set_effect("Air Danger");
             call.perform();
           } else {
@@ -883,6 +919,18 @@ script:
           // alarm is up, leave it alone -- airDangerCheck calls this script
           // again once the air clears, which repaints the correct band.
           if (id(air_danger_active)) {
+            return;
+          }
+
+          // Master switch, and mode. In alarm mode the steady colour is not
+          // drawn at all -- the LED is dark unless the strobe is running, which
+          // is what makes "dark" mean "nothing is wrong" at a glance.
+          if (id(air_quality_led_brightness).state <= 0.0f) {
+            id(rgb_light).turn_off().perform();
+            return;
+          }
+          if (id(led_alarm_mode).state) {
+            id(rgb_light).turn_off().perform();
             return;
           }
 
@@ -940,6 +988,18 @@ script:
   # Short delay so the caller's own light action lands first and
   # update_air_quality_led's is_running() guard passes. mode: restart so a
   # burst of callers collapses into one repaint.
+  # Re-applies whatever the two LED switches now say. Clearing
+  # air_danger_active first forces airDangerCheck past its "no transition"
+  # early return, so flipping into alarm mode while the air is already bad
+  # starts the strobe immediately instead of waiting for the next threshold
+  # crossing. mode: restart so double-tapping a toggle settles once.
+  - id: apply_led_state
+    mode: restart
+    then:
+      - lambda: "id(air_danger_active) = false;"
+      - script.execute: airDangerCheck
+      - script.execute: restore_air_quality_led
+
   - id: restore_air_quality_led
     mode: restart
     then:
