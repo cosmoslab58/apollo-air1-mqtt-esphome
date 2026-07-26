@@ -30,9 +30,14 @@
 #   - Air danger alarm: the RGB LED strobes through colors while CO2, AQI or
 #     VOC is at a genuinely harmful level. Each channel has its own threshold
 #     substitution below, and setting one to 0 switches that channel off — VOC
-#     ships off. Upstream drives the LED as a continuous air-quality
-#     indicator via an "Air Quality LED Source" select; this is instead a quiet
-#     LED that only lights for an emergency. See the README.
+#     ships off. The strobe always runs at 100% and ignores the LED Brightness
+#     slider. Upstream drives the LED as a continuous air-quality indicator via
+#     an "Air Quality LED Source" select; this is instead a quiet LED that only
+#     lights for an emergency. See the README.
+#   - Combined air-quality LED: the "Air Quality LED Source" select gains an
+#     "All" option (the new default), which colours the LED by the WORST band
+#     across NowCast AQI, CO2, VOC and NOx instead of one chosen metric. The
+#     LED repaints on every sensor reading rather than once per publish.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
 #     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
@@ -239,15 +244,30 @@ globals:
     type: bool
     initial_value: "false"
   # Latches whether the air-danger alarm is currently showing, so airDangerCheck
-  # only acts on transitions. Without it, every 60s cycle would re-issue
-  # turn_on and restart the strobe from its first color, making the alarm
-  # visibly stutter once a minute. Deliberately not restored across reboots:
+  # only acts on transitions. Without it, every evaluation would re-issue
+  # turn_on and restart the strobe from its first color -- and since the check
+  # now runs on every sensor reading rather than once per publish, the alarm
+  # would stutter several times a minute rather than once. Not restored:
   # the alarm state should be re-derived from live readings on boot, never
   # replayed from flash.
   - id: air_danger_active
     restore_value: no
     type: bool
     initial_value: "false"
+  # Last steady-colour state actually pushed to the LED, so update_air_quality_led
+  # can skip a redundant repaint. It now runs on every air-quality reading
+  # (~4 sensors x 10s) and LightCall::perform() publishes the light's MQTT state
+  # topic on every call whether or not anything changed -- without this the
+  # broker would carry ~24 identical rgb_light/state messages a minute.
+  # -2 is the "unknown, repaint unconditionally" sentinel; -1 means "off".
+  - id: led_last_band
+    restore_value: no
+    type: int
+    initial_value: "-2"
+  - id: led_last_level
+    restore_value: no
+    type: float
+    initial_value: "-1.0f"
 
 i2c:
   sda: GPIO1
@@ -274,9 +294,12 @@ interval:
           then:
             - script.execute: reportAllValues
 
-# Stock air-quality LED. Upstream Core.yaml drives rgb_light from one selected
-# metric, banded into six severity colors. Ships "Off", so the LED stays dark
-# until a source is picked -- same default as the factory firmware.
+# Stock air-quality LED. Upstream Core.yaml drives rgb_light from ONE selected
+# metric, banded into six severity colors. "All" is a local addition and the
+# default: it takes the worst band across every air-quality channel the device
+# has, so a spike on any one of them colours the LED. The single-metric options
+# are kept because pinning the LED to one channel is genuinely useful when you
+# are calibrating or debugging that channel.
 #
 # This is independent of the Air Danger strobe: the strobe overrides the steady
 # color while the air is genuinely unsafe, and the color is restored when it
@@ -289,8 +312,11 @@ select:
     optimistic: true
     restore_value: true
     entity_category: "config"
-    options: ["Off", "NowCast AQI", "CO2", "VOC Index"]
-    initial_option: "Off"
+    options: ["Off", "All", "NowCast AQI", "CO2", "VOC Index", "NOx Index"]
+    # restore_value keeps whatever the unit was last set to, so changing this
+    # only affects a factory-reset or newly flashed device. An already-deployed
+    # unit needs an explicit publish to the select's command topic.
+    initial_option: "All"
     on_value:
       then:
         - script.execute: update_air_quality_led
@@ -307,6 +333,13 @@ number:
     # Upstream's floor is 5; 0 is allowed here so the slider doubles as the
     # master off. There is deliberately no separate enable switch -- one
     # control that can reach zero beats two that can disagree.
+    #
+    # STEADY MODE ONLY. This slider has no effect while LED Alarm Mode is on --
+    # not even at 0. An alarm that a stray slider drag can dim to invisibility
+    # is not an alarm, so the strobe is hardcoded to 100% and ignores this
+    # control entirely. ESPHome template numbers cannot be greyed out at
+    # runtime, so the slider stays movable in alarm mode; it just does nothing
+    # until you switch back to indicator mode.
     min_value: 0
     max_value: 100
     step: 1
@@ -432,12 +465,13 @@ sensor:
     co2:
       name: "CO2"
       id: "co2"
+      # Unconditional: with the "All" source any channel can own the colour, so
+      # the script re-derives the whole LED state rather than each sensor
+      # guessing whether it is the selected one. led_evaluate also re-checks the
+      # danger alarm, which is what makes the LED react within a sample instead
+      # of waiting for the 60s reportAllValues tick.
       on_value:
-        - if:
-            condition:
-              lambda: 'return id(air_quality_led_source).current_option() == "CO2";'
-            then:
-              - script.execute: update_air_quality_led
+        - script.execute: led_evaluate
     # OFF deliberately, and unlike upstream there is no runtime switch for it.
     # ASC re-baselines by treating the lowest CO2 seen over a multi-day window
     # as fresh outdoor air (~400ppm). That assumption holds for a sensor that
@@ -449,7 +483,17 @@ sensor:
     # accepts the setting while idle and forgets it on power loss -- which is
     # not worth carrying for a setting that should stay off here.
     automatic_self_calibration: false
-    update_interval: 60s
+    # 10s to match the SEN55, so the LED tracks a CO2 change at roughly the rate
+    # a person notices one. The SCD40 in periodic mode produces a fresh sample
+    # every ~5s internally, so this reads real measurements rather than repeats
+    # of a cached one.
+    #
+    # This does NOT speed up data logging. Node-RED -> InfluxDB consumes the
+    # combined ${mqtt_topic}/state snapshot, which reportAllValues publishes on
+    # its own 60s interval and which force-updates every component first. The
+    # only cost here is that this sensor's individual state topic now publishes
+    # 6x more often -- a few bytes a second, retained, not written to Influx.
+    update_interval: 10s
     measurement_mode: "periodic"
     i2c_id: bus_a
     ambient_pressure_compensation_source: dps310pressure
@@ -502,11 +546,7 @@ sensor:
       name: "SEN55 VOC"
       id: sen55_voc
       on_value:
-        - if:
-            condition:
-              lambda: 'return id(air_quality_led_source).current_option() == "VOC Index";'
-            then:
-              - script.execute: update_air_quality_led
+        - script.execute: led_evaluate
       algorithm_tuning:
         # https://sensirion.com/media/documents/25AB572C/62B463AA/Sensirion_Engineering_Guidelines_SEN5x.pdf
         index_offset: 100
@@ -518,6 +558,8 @@ sensor:
     nox:
       name: "SEN55 NOX"
       id: sen55_nox
+      on_value:
+        - script.execute: led_evaluate
     acceleration_mode: low
     store_baseline: true
     # Some units misreport SEN54 on the product name register even though the
@@ -577,11 +619,7 @@ sensor:
     calculation_type: AQI
     device_class: aqi
     on_value:
-      - if:
-          condition:
-            lambda: 'return id(air_quality_led_source).current_option() == "NowCast AQI";'
-          then:
-            - script.execute: update_air_quality_led
+      - script.execute: led_evaluate
 
 light:
   - platform: esp32_rmt_led_strip
@@ -716,8 +754,9 @@ text_sensor:
 
 switch:
   # Which of the two behaviours the LED runs. ON  = alarm only: dark until a
-  # reading crosses a danger threshold, then the strobe. OFF = steady
-  # air-quality colour from Air Quality LED Source, and no strobe. They are
+  # reading crosses a danger threshold, then the strobe, always at 100% with the
+  # LED Brightness slider inert. OFF = steady air-quality colour from Air
+  # Quality LED Source at the slider's brightness, and no strobe. They are
   # deliberately exclusive -- running both means the steady colour is really
   # just "the alarm is not firing", which is not worth an LED.
   - platform: template
@@ -830,10 +869,12 @@ script:
   # actually harmful to breathe, and clears it once everything is back under.
   # Thresholds and their justification live in the substitutions at the top.
   #
-  # Runs at the end of reportAllValues, so it re-evaluates on every publish:
-  # once a minute on USB power, and once per wake in battery/deep-sleep mode
-  # (where the LED is necessarily dark while asleep -- this is a mains-powered
-  # feature in practice).
+  # Driven by led_evaluate off every air-quality sensor's on_value, so on USB
+  # power it re-evaluates roughly every 10s. Also runs at the end of
+  # reportAllValues, which guarantees the LED and the published snapshot can
+  # never disagree about the same cycle, and which is the only evaluation that
+  # happens in battery/deep-sleep mode -- one per wake, with the LED necessarily
+  # dark while asleep. This is a mains-powered feature in practice.
   - id: airDangerCheck
     mode: single
     then:
@@ -841,10 +882,14 @@ script:
           // Do NOT name these after entity ids -- id(co2) generates `co2->state`,
           // so a local called `co2` shadows the entity pointer and fails to
           // compile with "base operand of '->' is not a pointer".
-          // Master switch and mode gate the alarm. If it was firing when the
-          // mode changed, drop it and hand the LED back to the steady colour,
-          // which turns it off by itself when disabled or set to "Off".
-          if (id(air_quality_led_brightness).state <= 0.0f || !id(led_alarm_mode).state) {
+          // Mode gates the alarm, and nothing else does. The brightness slider
+          // is deliberately NOT consulted here -- see the number's comment: an
+          // alarm you can accidentally dim to nothing is not an alarm, so in
+          // alarm mode the slider is inert and the strobe always runs at 100%.
+          // If the alarm was firing when the mode changed, drop it and hand the
+          // LED back to the steady colour, which turns itself off when the
+          // slider is at 0 or the source is "Off".
+          if (!id(led_alarm_mode).state) {
             if (id(air_danger_active)) {
               id(air_danger_active) = false;
               id(rgb_light).turn_off().perform();
@@ -879,11 +924,15 @@ script:
 
           if (danger) {
             ESP_LOGW("Apollo", "AIR DANGER: co2=%.0fppm aqi=%.0f voc=%.0f -- alarm ON", co2_ppm, aqi_val, voc_val);
+            // A steady-mode attention blink may be mid-flight; it modulates
+            // brightness and would fight the strobe for control of the light.
+            id(led_pulse).stop();
             auto call = id(rgb_light).turn_on();
-            // The strobe's own colours are defined at 100%; the light's master
-            // brightness scales them, so the slider dims the alarm as well as
-            // the steady colour rather than only one of the two.
-            call.set_brightness(id(air_quality_led_brightness).state / 100.0f);
+            // Hardcoded full brightness. The strobe's own colours are defined
+            // at 100% and the master brightness would scale them, so this has
+            // to be set explicitly -- otherwise the light would inherit
+            // whatever the steady colour last left here.
+            call.set_brightness(1.0f);
             call.set_effect("Air Danger");
             call.perform();
           } else {
@@ -922,68 +971,204 @@ script:
             return;
           }
 
-          // Master switch, and mode. In alarm mode the steady colour is not
-          // drawn at all -- the LED is dark unless the strobe is running, which
-          // is what makes "dark" mean "nothing is wrong" at a glance.
-          if (id(air_quality_led_brightness).state <= 0.0f) {
-            id(rgb_light).turn_off().perform();
-            return;
-          }
-          if (id(led_alarm_mode).state) {
-            id(rgb_light).turn_off().perform();
-            return;
-          }
+          // Everything below computes a DESIRED state -- band (-1 = LED off)
+          // plus a brightness -- and applies it exactly once at the bottom,
+          // through the dedup guard. Nothing here may touch rgb_light directly.
+          int band = -1;
+          float level = id(air_quality_led_brightness).state / 100.0f;
 
           const std::string src = id(air_quality_led_source).current_option();
 
-          if (src == "Off") {
+          // Map a metric to a severity band: 0=Good ... 5=Hazardous, or -1 for
+          // "no usable reading". Each metric has its own scale, but they all
+          // land on the same 0-5 band and share one colour table below -- which
+          // is what makes the worst-of comparison in "All" meaningful.
+          auto band_aqi = [](float x) -> int {       // US EPA AQI
+            if (isnan(x)) return -1;
+            if (x <= 50)   return 0;
+            if (x <= 100)  return 1;
+            if (x <= 150)  return 2;
+            if (x <= 200)  return 3;
+            if (x <= 300)  return 4;
+            return 5;
+          };
+          auto band_co2 = [](float x) -> int {       // ppm, SCD40
+            if (isnan(x)) return -1;
+            if (x <= 800)  return 0;
+            if (x <= 1000) return 1;
+            if (x <= 1500) return 2;
+            if (x <= 2000) return 3;
+            if (x <= 2500) return 4;
+            return 5;
+          };
+          // The two Sensirion gas indices run 1-500 and are RELATIVE to a
+          // learned baseline, so they answer "different from recent normal?"
+          // rather than "harmful?". Their top band is "extremely abnormal",
+          // which is not the same claim as EPA "Hazardous" -- so both cap at
+          // band 4 and neither can ever drive the LED to band 5 on its own.
+          // VOC is centred on index_offset 100 (set in algorithm_tuning above);
+          // NOx uses the driver's default offset of 1, which is why its first
+          // boundary is so much lower rather than a copy-paste slip.
+          auto band_voc = [](float x) -> int {
+            if (isnan(x)) return -1;
+            if (x < 80)   return 0;
+            if (x < 150)  return 1;
+            if (x < 250)  return 2;
+            if (x < 400)  return 3;
+            return 4;
+          };
+          auto band_nox = [](float x) -> int {
+            if (isnan(x)) return -1;
+            if (x < 20)   return 0;
+            if (x < 150)  return 1;
+            if (x < 250)  return 2;
+            if (x < 400)  return 3;
+            return 4;
+          };
+
+          // Master switch, and mode, folded into the head of the same chain so
+          // there is exactly one place that decides the band. In alarm mode the
+          // steady colour is not drawn at all -- the LED is dark unless the
+          // strobe is running, which is what makes "dark" mean "nothing is
+          // wrong" at a glance.
+          if (level <= 0.0f || id(led_alarm_mode).state || src == "Off") {
+            band = -1;
+          } else if (src == "All") {
+            // Worst-of across every air-quality channel the device has, so a
+            // spike on any one of them shows up. A channel with no reading yet
+            // returns -1 and simply does not vote: a warming-up SCD40 or a
+            // post-reset VOC baseline can neither pin the colour at green nor
+            // invent a red.
+            band = std::max(std::max(band_aqi(id(nowcast_aqi).state), band_co2(id(co2).state)),
+                            std::max(band_voc(id(sen55_voc).state), band_nox(id(sen55_nox).state)));
+          } else if (src == "NowCast AQI") {
+            band = band_aqi(id(nowcast_aqi).state);
+          } else if (src == "CO2") {
+            band = band_co2(id(co2).state);
+          } else if (src == "VOC Index") {
+            band = band_voc(id(sen55_voc).state);
+          } else if (src == "NOx Index") {
+            band = band_nox(id(sen55_nox).state);
+          }
+          // band is still -1 here if every selected channel read NaN: stay dark
+          // rather than hold a stale colour that would look like a measurement.
+
+          // Maroon - Hazardous, expressed as a DIMMED red rather than a dark red
+          // channel value. Every LightCall runs normalize_color(), which
+          // rescales RGB so the brightest channel is 1.0, so the obvious
+          // set_rgb(0.5, 0, 0) is pushed straight back to pure red and would
+          // render pixel-identical to band 3. Brightness is the only axis left
+          // that survives normalisation. Applied here, before the dedup
+          // comparison, so the cached level matches what was really sent.
+          if (band == 5) {
+            level *= 0.45f;
+          }
+          if (band < 0) {
+            level = 0.0f;
+          }
+
+          // Dedup. Skip the repaint when the desired state is already on the
+          // LED, so a steady-state device is silent on the broker. The is_on
+          // cross-check catches anything that grabbed the light without going
+          // through here (testScript's direct turn_off, a manual MQTT light
+          // command), where the cache alone would wrongly say "no work to do".
+          if (band == id(led_last_band) && fabsf(level - id(led_last_level)) < 0.001f &&
+              id(rgb_light).remote_values.is_on() == (band >= 0)) {
+            return;
+          }
+          // A WORSENING band change earns an attention pulse; everything else
+          // just crossfades. A previous band below 0 is deliberately NOT a
+          // worsening: the LED was off, or its state was unknown after a status
+          // flash, and neither says anything about the air having got worse.
+          const int prev = id(led_last_band);
+          const bool worse = (prev >= 0 && band > prev);
+
+          id(led_last_band) = band;
+          id(led_last_level) = level;
+
+          if (band < 0) {
+            id(led_pulse).stop();
             id(rgb_light).turn_off().perform();
             return;
           }
 
-          // Map the selected metric to a severity band: 0=Good ... 5=Hazardous.
-          // Each metric has its own scale; bands share one colour table below.
-          int band = -1;
-          if (src == "NowCast AQI") {                // US EPA AQI
-            const float x = id(nowcast_aqi).state;
-            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
-            if      (x <= 50)   band = 0;
-            else if (x <= 100)  band = 1;
-            else if (x <= 150)  band = 2;
-            else if (x <= 200)  band = 3;
-            else if (x <= 300)  band = 4;
-            else                band = 5;
-          } else if (src == "CO2") {                 // ppm, SCD40
-            const float x = id(co2).state;
-            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
-            if      (x <= 800)  band = 0;
-            else if (x <= 1000) band = 1;
-            else if (x <= 1500) band = 2;
-            else if (x <= 2000) band = 3;
-            else if (x <= 2500) band = 4;
-            else                band = 5;
-          } else if (src == "VOC Index") {           // Sensirion VOC index
-            const float x = id(sen55_voc).state;
-            if (isnan(x)) { id(rgb_light).turn_off().perform(); return; }
-            if      (x < 80)    band = 0;
-            else if (x < 150)   band = 1;
-            else if (x < 250)   band = 2;
-            else if (x < 400)   band = 3;
-            else                band = 4;            // VOC tops out at "extremely abnormal"
-          }
-          if (band < 0) return;
-
           auto call = id(rgb_light).turn_on();
-          call.set_brightness(id(air_quality_led_brightness).state / 100.0f);
           switch (band) {
             case 0: call.set_rgb(0.0f, 1.0f, 0.0f); break;   // Green  - Good
             case 1: call.set_rgb(1.0f, 1.0f, 0.0f); break;   // Yellow - Moderate
             case 2: call.set_rgb(1.0f, 0.5f, 0.0f); break;   // Orange - Unhealthy (Sensitive)
             case 3: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Red    - Unhealthy
             case 4: call.set_rgb(0.6f, 0.0f, 1.0f); break;   // Purple - Very Unhealthy
-            case 5: call.set_rgb(0.5f, 0.0f, 0.0f); break;   // Maroon - Hazardous
+            case 5: call.set_rgb(1.0f, 0.0f, 0.0f); break;   // Maroon - Hazardous (dimmed above)
           }
+          call.set_brightness(level);
+          // Every change eases across, worsening included -- led_pulse waits
+          // out this fade before it swells, so the two read as one gesture
+          // (fade to the new colour, swell once, settle) rather than fighting.
+          call.set_transition_length(1000);
           call.perform();
+
+          if (worse) {
+            id(led_pulse).execute();
+          } else {
+            // An improvement while a pulse is mid-flight must cancel it --
+            // otherwise the blink keeps dipping the brightness of a colour that
+            // no longer means what the pulse was announcing.
+            id(led_pulse).stop();
+          }
+
+  # Attention swell for a worsening band change, fired by update_air_quality_led
+  # once it has painted the new colour. One smooth rise to full brightness and
+  # back down to the steady level -- not a blink. Deliberately modulates ONLY
+  # brightness: a LightCall changes just the fields it sets, so the colour
+  # painted a moment earlier is preserved and this script never needs its own
+  # copy of the band colour table.
+  #
+  # The opening delay waits out update_air_quality_led's 1s colour crossfade, so
+  # the whole thing reads as one gesture: fade to the new colour, swell once,
+  # settle. Starting the swell during the fade would just fight it.
+  #
+  # mode: restart so a second degradation part-way through (yellow -> orange ->
+  # red in quick succession) restarts the gesture on the newer colour rather
+  # than queueing a second one. update_air_quality_led calls stop() on it
+  # whenever the air improves or the LED goes dark, and airDangerCheck stops it
+  # before raising the strobe -- in all three cases a swell left running would
+  # be modulating a colour that no longer means what it was announcing.
+  #
+  # NOTE: the swell needs headroom above the steady level to be visible. With
+  # LED Brightness at 100% and a band below Hazardous, steady IS full brightness
+  # and there is nothing to swell into.
+  - id: led_pulse
+    mode: restart
+    then:
+      - delay: 1s
+      - light.turn_on:
+          id: rgb_light
+          brightness: 100%
+          transition_length: 500ms
+      - delay: 500ms
+      - light.turn_on:
+          id: rgb_light
+          brightness: !lambda "return id(led_last_level);"
+          transition_length: 800ms
+
+  # Re-derives the whole LED state from the current readings: alarm first, then
+  # the steady colour (which no-ops while the alarm owns the light). Hung off
+  # every air-quality sensor's on_value, so both the strobe and the colour react
+  # within one sample period instead of waiting for the 60s reportAllValues
+  # tick. Cheap enough to run that often -- two lambdas, no delays, no I/O, and
+  # both bail early when nothing has changed.
+  #
+  # mode: single is safe precisely because there are no delays here: both
+  # callees are pure lambdas that run to completion synchronously, so this can
+  # never still be running when the next sensor fires. (update_air_quality_led
+  # may dispatch led_pulse, which does have delays -- but execute() only
+  # schedules it, so this chain still returns immediately.)
+  - id: led_evaluate
+    mode: single
+    then:
+      - script.execute: airDangerCheck
+      - script.execute: update_air_quality_led
 
   # Short delay so the caller's own light action lands first and
   # update_air_quality_led's is_running() guard passes. mode: restart so a
@@ -1003,6 +1188,13 @@ script:
   - id: restore_air_quality_led
     mode: restart
     then:
+      # Invalidate the dedup cache. This script is the universal "something else
+      # was driving the LED, hand it back" path -- boot/button statusCheck, the
+      # danger strobe clearing, a mode change. In every case the light is
+      # showing something the cache does not describe, and statusCheck in
+      # particular can leave it ON in a colour that would otherwise compare
+      # equal to the cached band and be skipped.
+      - lambda: "id(led_last_band) = -2;"
       - delay: 200ms
       - script.execute: update_air_quality_led
 

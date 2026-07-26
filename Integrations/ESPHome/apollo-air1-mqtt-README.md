@@ -120,27 +120,78 @@ with its default `esphome/apollo-air-1`.
 
 ## Air quality LED
 
-The steady RGB colour from the stock firmware, ported from upstream `Core.yaml`
-unchanged. Two config entities drive it:
+The steady RGB colour, ported from upstream `Core.yaml` and then extended with a
+combined `All` mode. Two config entities drive it:
 
 | Entity | Values | Default |
 |---|---|---|
-| `Air Quality LED Source` | `Off`, `NowCast AQI`, `CO2`, `VOC Index` | `Off` |
-| `Air Quality LED Brightness` | 5–100 % | 100 |
+| `Air Quality LED Source` | `Off`, `All`, `NowCast AQI`, `CO2`, `VOC Index`, `NOx Index` | `All` |
+| `LED Brightness` | 0–100 % (0 = off) | 100 |
 
-The selected metric is banded into six severity levels sharing one colour table:
+`All` is the local addition and the default: it colours the LED by the **worst**
+band across every air-quality channel at once, so a spike on any one of them is
+visible without knowing in advance which to watch. The single-metric options pin
+the LED to one channel, which is what you want while calibrating or debugging
+that channel. Each metric is banded into severity levels sharing one colour
+table:
 
-| Band | Colour | NowCast AQI | CO2 (ppm) | VOC Index |
-|---|---|---|---|---|
-| Good | Green | ≤ 50 | ≤ 800 | < 80 |
-| Moderate | Yellow | ≤ 100 | ≤ 1000 | < 150 |
-| Unhealthy (sensitive) | Orange | ≤ 150 | ≤ 1500 | < 250 |
-| Unhealthy | Red | ≤ 200 | ≤ 2000 | < 400 |
-| Very unhealthy | Purple | ≤ 300 | ≤ 2500 | ≥ 400 |
-| Hazardous | Maroon | > 300 | > 2500 | — |
+| Band | Colour | NowCast AQI | CO2 (ppm) | VOC Index | NOx Index |
+|---|---|---|---|---|---|
+| Good | Green | ≤ 50 | ≤ 800 | < 80 | < 20 |
+| Moderate | Yellow | ≤ 100 | ≤ 1000 | < 150 | < 150 |
+| Unhealthy (sensitive) | Orange | ≤ 150 | ≤ 1500 | < 250 | < 250 |
+| Unhealthy | Red | ≤ 200 | ≤ 2000 | < 400 | < 400 |
+| Very unhealthy | Purple | ≤ 300 | ≤ 2500 | ≥ 400 | ≥ 400 |
+| Hazardous | Dim red | > 300 | > 2500 | — | — |
 
-A metric that has not produced a reading yet (NaN) turns the LED off rather than
-showing a stale colour, so a missing module reads as dark, not as "Good".
+The two Sensirion gas indices cap at *Very unhealthy*. They are relative to a
+learned ~72 h baseline, so they measure "different from recent normal", not
+"harmful" — which is not a claim that justifies the top band. Only the two
+absolute, calibrated scales can drive the LED to *Hazardous*. Their band edges
+differ because VOC is centred on an index offset of 100 while NOx uses the
+driver default of 1.
+
+*Hazardous* is rendered as a dimmed red rather than a true maroon. ESPHome
+normalises every light call so the brightest RGB channel becomes 1.0, so a
+"dark red" `set_rgb(0.5, 0, 0)` is rescaled straight back to pure red and is
+indistinguishable from the *Unhealthy* band — brightness is the only axis that
+survives normalisation.
+
+A metric that has not produced a reading yet (NaN) does not vote. Under `All` a
+warming-up SCD40 or a post-reset VOC baseline can neither hold the colour at
+green nor invent a red; if *every* selected channel is NaN the LED goes dark, so
+a missing module reads as dark, not as "Good".
+
+The LED repaints on every sensor reading (~10 s), not once per MQTT publish, so
+it tracks a change at about the rate a person notices one. Repaints that would
+not change anything are skipped, which keeps the light's own MQTT state topic
+quiet on an idle device.
+
+### Fade and pulse
+
+Band changes are not instant swaps:
+
+| Change | Behaviour |
+|---|---|
+| Air improves (e.g. orange → green) | 1 s crossfade |
+| Air worsens (e.g. green → orange) | Snap to the new colour, blink it 3× , then hold |
+| Brightness slider moved | 1 s crossfade |
+| LED turning off | Instant, so the `0 %` master-off feels responsive |
+
+A degradation is the thing worth looking up for, so it announces itself; an
+improvement does not need to interrupt you. The pulse modulates brightness only,
+dipping to 10 % of the current level and back, so it stays proportional whatever
+the slider is set to. A worsening skips the crossfade because a 1 s colour fade
+underneath a blink muddies both.
+
+Going from off to a colour is not treated as a worsening — the LED being enabled
+says nothing about the air. Pulses are cancelled if the air improves mid-blink,
+if the LED goes dark, or if the danger alarm fires, since in each case the blink
+would be dimming a colour that no longer means what it was announcing.
+
+> The alarm strobe is never faded. ESPHome rejects a transition and an effect in
+> the same light call, so the fade necessarily lives only in the steady-state
+> path — which is also where you want it.
 
 ### How it interacts with the air danger alarm
 
@@ -154,9 +205,14 @@ not written in the first 5 s after boot (the select's `restore_value` fires
 `on_value` before the LED strip is initialised, which faults), and repaints are
 skipped while `statusCheck` or `testScript` is running.
 
-> Note: `restore_value: true` means the source survives reboots. After first
-> flashing this change the restored value may not be `Off` — check the entity
-> and set it deliberately.
+> Note: `restore_value: true` means the source survives reboots, so the `All`
+> default only applies to a newly flashed or factory-reset unit. An already
+> deployed device keeps whatever it was last set to — check the entity and set
+> it deliberately:
+>
+> ```bash
+> mosquitto_pub -t '<topic>/select/air_quality_led_source/command' -m 'All'
+> ```
 
 ## Air danger alarm
 
@@ -199,12 +255,18 @@ Notes and caveats:
   sensor that never reports reads as "not dangerous". This is an alerting
   convenience, not a life-safety device — it is not a substitute for a CO or
   smoke alarm, neither of which this hardware can detect at all.
-- **It is a mains-powered feature in practice.** Evaluation happens on each
-  publish, so on USB power that is once a minute. On battery the device is
-  asleep (and the LED dark) for most of each 5-minute cycle.
+- **The strobe always runs at 100%, and `LED Brightness` is inert in alarm
+  mode** — not even `0` silences it. An alarm a stray slider drag can dim to
+  invisibility is not an alarm. The slider applies only to the steady indicator
+  colour. (ESPHome template numbers cannot be greyed out at runtime, so the
+  slider stays movable while alarm mode is on; it simply has no effect.)
+- **It is a mains-powered feature in practice.** Evaluation happens on every
+  air-quality reading, so on USB power that is roughly every 10 seconds. On
+  battery the device is asleep (and the LED dark) for most of each 5-minute
+  cycle.
 - The alarm is edge-triggered — it fires once on the transition rather than
   re-issuing every cycle, so the strobe runs continuously instead of restarting
-  from its first color every minute.
+  from its first color on every reading.
 - It overrides the LED, so it will paint over the boot status colors
   (blue/green/yellow) that `statusCheck` shows for the first 5 seconds.
 
