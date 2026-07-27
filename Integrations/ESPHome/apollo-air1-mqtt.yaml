@@ -22,11 +22,27 @@
 #     and the component would only fail its I2C init and publish null gas
 #     fields. The CO2 add-on (SCD40) is kept. If your unit HAS the MICS-4514,
 #     copy the `mics_4514:` block back in from upstream `Core.yaml`.
-#   - Continuous-mode data: a 60s `interval:` re-publishes the combined
+#   - Continuous-mode data: an `interval:` re-publishes the combined
 #     `${mqtt_topic}/state` snapshot whenever `prevent_sleep` is on (the
-#     default). On USB power the device stays awake and streams one point per
-#     minute; on battery (prevent_sleep off) it reverts to one publish per
-#     deep-sleep wake. See apollo-air1-mqtt-README.md.
+#     default). On USB power the device stays awake and streams points; on
+#     battery (prevent_sleep off) it reverts to one publish per deep-sleep wake.
+#     See apollo-air1-mqtt-README.md.
+#   - Adaptive publish cadence: that interval is not a flat 60s. While the worst
+#     severity band across PM AQI, CO2, VOC and NOx is at `publish_elevated_band`
+#     or above it publishes every `publish_period_elevated_s` instead of
+#     `publish_period_s`, and a band CHANGE publishes within a second at either
+#     rate — so a dashboard refreshed just after the LED changes colour shows the
+#     reading that caused it. Driven by air_band_worst, deliberately not by the
+#     LED, so turning the LED down or off does not slow the data down.
+#   - One band table, exported. The `band_cuts_*` globals are the only definition
+#     of severity in the system: they grade the readings, set the cadence, and
+#     pick the LED colour. `publish_band_config` publishes them to
+#     `${mqtt_topic}/config/bands` (retained) so the dashboard colours its UI
+#     from the device's numbers instead of its own — the two had genuinely
+#     drifted (CO2 banded at 1000/1500/2000 in the app vs 800/1100/2000/3500/5000
+#     here, so 900ppm showed green on screen while the LED was yellow).
+#     `air_band` is also in every /state snapshot, recording the band the device
+#     actually graded that reading at.
 #   - Air danger alarm: the RGB LED strobes through colors while CO2, AQI or
 #     VOC is at a genuinely harmful level. Each channel has its own threshold
 #     substitution below, and setting one to 0 switches that channel off — VOC
@@ -53,7 +69,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.15-mqtt"
+  version: "1.1.16-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -63,6 +79,66 @@ substitutions:
   # 8883 = TLS (requires mqtt_ca_cert in secrets.yaml). For a plaintext broker,
   # set this to 1883 AND comment out the `certificate_authority:` line below.
   mqtt_port: "8883"
+
+  # --- Publish cadence (continuous / USB mode only) --------------------------
+  # How often the combined ${mqtt_topic}/state snapshot goes out while
+  # prevent_sleep is on. Two rates, because a dashboard is only worth keeping
+  # fresh when something is actually moving:
+  #
+  #   publish_period_s           below publish_elevated_band, or nothing read yet
+  #   publish_period_elevated_s  worst band >= publish_elevated_band (1 = above green)
+  #
+  # publish_elevated_band is 1 -- "anything above green" -- and that is only
+  # honest because band 0 now means what it says. It is worth understanding why
+  # this setting exists at all, because it is coupled to the VOC table.
+  #
+  # With the VOC first cut at the 80 this config inherited from upstream, band
+  # >= 1 was true 50.5% of the time on real data, and 94% of that was VOC idling
+  # at its own baseline -- a permanent 2.5x rise in recording rate signalling
+  # nothing. The fix at the time was to raise this threshold to 2, which worked
+  # but treated the symptom. Retuning band_cuts_voc to start at 150 fixed the
+  # cause, and band >= 1 is now true 5.3% of the time (1.16x the points/day of a
+  # flat 60s), so the plain reading of "above green" is usable again.
+  #
+  # If you retune band_cuts_voc back down, revisit this number too -- measure the
+  # fraction of time spent above the threshold before trusting it.
+  #
+  # The band-CHANGE publish below is independent of this: crossing ANY boundary
+  # publishes within a second, so you never miss the moment the LED changes
+  # colour even if the threshold is set high. This governs only whether the fast
+  # STEADY rate is held afterwards.
+  #
+  # "Worst band" is the same 0-5 severity used to colour the LED, taken across
+  # PM AQI, CO2, VOC and NOx -- but read from air_band_worst, NOT from the LED.
+  # The two are deliberately decoupled: LED Brightness 0 or Air Quality LED
+  # Source "Off" means a dark LED, not stale data.
+  #
+  # A band CHANGE also publishes immediately at either rate, so the first
+  # snapshot showing the new colour lands within a second of the LED changing
+  # instead of up to a full period later. That is the case someone refreshing
+  # the page is usually trying to catch.
+  #
+  # Set the two equal for one fixed rate (upstream's behaviour).
+  #
+  # DON'T GO FASTER THAN THE SENSORS. The useful floor is ~5s, set by the SCD40:
+  # in periodic mode it produces a new measurement every ~5s internally, and the
+  # SEN55 every ~1s. (Those are the real limits, not the 10s `update_interval`s
+  # in this file -- reportAllValues force-updates every component before it
+  # serialises, so a publish always triggers a fresh read regardless of the
+  # configured polling interval.) Below ~5s consecutive snapshots would start
+  # repeating the same CO2 reading: more rows in InfluxDB, no more information.
+  # 15s is ~3x that floor, so every elevated publish carries genuinely new data
+  # on every channel.
+  #
+  # The 1s tick of the interval below is a hard floor too, but it is scheduler
+  # granularity and reads no sensors -- see the comment there.
+  #
+  # None of this applies in battery/deep-sleep mode (prevent_sleep off): the
+  # device is asleep for most of the cycle and publishes once per wake. See
+  # "Publish cadence" in the README.
+  publish_period_s: "60"
+  publish_period_elevated_s: "15"
+  publish_elevated_band: "1"
 
   # --- Air danger alarm ------------------------------------------------------
   # Thresholds at which the RGB LED strobes through colors as a get-out-of-the-
@@ -213,6 +289,12 @@ mqtt:
                   md5_url: !lambda 'return std::string(x["url"] | "") + ".md5";'
   on_connect:
     - delay: 20s
+    # Retained, so this only has to succeed once per connect to keep every
+    # consumer's colours in step with the LED -- including consumers that are
+    # not running right now. Before the first snapshot, so a dashboard that
+    # subscribes and immediately gets a reading already has the table to colour
+    # it with.
+    - script.execute: publish_band_config
     - lambda: |-
         id(reportAllValues).execute();
     - delay: 3s
@@ -270,6 +352,152 @@ globals:
     type: float
     initial_value: "-1.0f"
 
+  # ===========================================================================
+  # THE BAND TABLES. This is the single source of truth for "how bad is it" on
+  # this device, and there is deliberately no second copy anywhere -- not in
+  # another lambda, not in the dashboard, not in Node-RED. compute_air_bands
+  # grades readings against these, and publish_band_config publishes the very
+  # same arrays to ${mqtt_topic}/config/bands (retained) so consumers colour
+  # their UI from the device's numbers instead of their own. A dashboard showing
+  # green while the LED is yellow is the failure mode this exists to prevent.
+  #
+  # Convention, uniform across all four: band i is the first i where
+  # `value <= cuts[i]`, else the last band. Upper bound INCLUSIVE, matching
+  # EPA's own breakpoint style (0-50 Good, 51-100 Moderate). VOC and NOx used
+  # exclusive `<` before this was unified, so their boundaries have shifted by
+  # one index unit -- VOC exactly 150 is now band 1 rather than band 2. That is
+  # immaterial on a 1-500 relative index and buys an unambiguous shared
+  # contract; the alternative was publishing 79/149/249/399 to preserve the old
+  # edges exactly, which nobody reading the JSON would understand.
+  #
+  # Array length sets the number of bands: 5 cuts -> bands 0-5, 4 cuts ->
+  # bands 0-4. That is how VOC and NOx cap at 4 without a special case (see
+  # their comments below for why they must never reach 5).
+  #
+  # US EPA AQI. The one genuinely regulated scale here.
+  - id: band_cuts_aqi
+    restore_value: no
+    type: int[5]
+    initial_value: "{50, 100, 150, 200, 300}"
+  # ppm, SCD40. Retuned away from upstream's 800/1000/1500/2000/2500, which
+  # paired its top band with the name "Hazardous" at 2500ppm -- an ordinary
+  # closed bedroom overnight.
+  #
+  # There is NO official government severity scale for indoor CO2. EPA does not
+  # regulate it (not a criteria pollutant), and the WHO indoor air quality
+  # guidelines do not cover it. Only three points are anchored at all:
+  #
+  #   800   CDC ventilation guidance for shared indoor spaces. A
+  #         ventilation-adequacy proxy, NOT a health threshold.
+  #   1100  ASHRAE comfort/odour range (~700ppm above outdoor ambient). Also a
+  #         professional-society figure, not a regulation.
+  #   5000  OSHA PEL (29 CFR 1910.1000) and NIOSH REL, 8h TWA. The one
+  #         enforceable number in the whole scale.
+  #
+  # 2000 and 3500 are interpolation between those, and are labelled in the
+  # README as judgement calls rather than guidance. The top band coincides with
+  # the danger_co2_ppm strobe threshold instead of sitting at half of it, so
+  # "worst steady colour" means "you are at the level that trips the alarm"
+  # rather than contradicting it.
+  #
+  # Caveat no threshold can fix: the PEL is an 8h occupational limit for healthy
+  # adult workers. This unit is in a bedroom.
+  - id: band_cuts_co2
+    restore_value: no
+    type: int[5]
+    initial_value: "{800, 1100, 2000, 3500, 5000}"
+  # The two Sensirion gas indices run 1-500 and are RELATIVE to a learned
+  # baseline, so they answer "different from recent normal?" rather than
+  # "harmful?". Their top rung is "extremely abnormal", which is not a severity
+  # claim at all -- hence only 4 cuts, so neither can ever drive the LED to
+  # band 5 on its own.
+  #
+  # The first cut is 150, NOT the 80 inherited from upstream, and this is the
+  # one number here chosen from measurement rather than from a guideline.
+  #
+  # algorithm_tuning sets index_offset 100, which means the algorithm reports
+  # ~100 when conditions match its own learned baseline. A first cut of 80 put
+  # the sensor's definition of "nothing unusual" in band 1 -- band 0 meant
+  # "quieter than typical", a state a self-baselining index visits about half
+  # the time and never stays in. Measured over 2.5 days of this unit's data:
+  # band 0 only 50% of the time, the 80 line crossed ~27x/day with nothing
+  # happening, and the LED yellow half its life by construction.
+  #
+  # 150 is the top of this unit's observed idle range, so band 0 now means
+  # "normal or better" and covers 94.7% of samples. Real events still register
+  # clearly -- brewed coffee two rooms away reached 424, i.e. band 3.
+  #
+  # NOx below is the control that proves the diagnosis: its offset is the
+  # driver's default of 1, far below its first cut of 20, and it correctly reads
+  # band 0 99% of the time with no retuning at all.
+  #
+  # Three cuts, so VOC tops out at band 3 (red) rather than the 4 (purple) it
+  # could reach before. Same reasoning that already stopped it at 4 instead of 5,
+  # applied one notch further: this is a RELATIVE deviation index, and letting it
+  # claim a band whose AQI meaning is "very unhealthy" is the same category error
+  # as letting it claim "hazardous". Add a fourth cut if you want that band back.
+  - id: band_cuts_voc
+    restore_value: no
+    type: int[3]
+    initial_value: "{150, 250, 400}"
+  # NOx uses the driver's default index_offset of 1, which is why its first
+  # boundary is so much lower than VOC's rather than a copy-paste slip.
+  - id: band_cuts_nox
+    restore_value: no
+    type: int[4]
+    initial_value: "{20, 150, 250, 400}"
+
+  # Severity band per channel (0 = best ... 5 = worst, -1 = no usable reading),
+  # plus the worst across all four. Recomputed by compute_air_bands on every
+  # sensor reading and never written anywhere else.
+  #
+  # These were local variables inside update_air_quality_led until the publish
+  # cadence needed them too. Hoisting them keeps the threshold tables in ONE
+  # place, which matters because the two consumers want different slices of the
+  # same answer: the LED paints whichever channel the source select names, while
+  # the cadence always wants the worst-of and must be indifferent to how the LED
+  # is configured. Duplicating the tables would mean retuning CO2 twice and
+  # eventually having a dashboard that disagrees with the light on the wall.
+  #
+  # Not restored: bands are a statement about the air right now, and replaying
+  # a stale one from flash would make a freshly booted device publish fast (or
+  # paint a colour) on evidence that no longer exists.
+  - id: air_band_aqi
+    restore_value: no
+    type: int
+    initial_value: "-1"
+  - id: air_band_co2
+    restore_value: no
+    type: int
+    initial_value: "-1"
+  - id: air_band_voc
+    restore_value: no
+    type: int
+    initial_value: "-1"
+  - id: air_band_nox
+    restore_value: no
+    type: int
+    initial_value: "-1"
+  - id: air_band_worst
+    restore_value: no
+    type: int
+    initial_value: "-1"
+
+  # Publish-cadence bookkeeping for the interval below. publish_last_band starts
+  # at -1 to match air_band_worst's own "nothing read yet" value, so the first
+  # real reading registers as a change (-1 -> whatever the air is) and gets a
+  # point out promptly instead of waiting a full period behind the on_connect
+  # publish. publish_last_ms is compared with unsigned arithmetic, which is
+  # rollover-safe at the ~49 day millis() wrap.
+  - id: publish_last_ms
+    restore_value: no
+    type: uint32_t
+    initial_value: "0"
+  - id: publish_last_band
+    restore_value: no
+    type: int
+    initial_value: "-1"
+
 i2c:
   sda: GPIO1
   scl: GPIO0
@@ -281,19 +509,55 @@ deep_sleep:
   run_duration: 2min
 
 # Continuous (USB) mode: while prevent_sleep is on, re-publish the combined
-# /state snapshot every 60s so your consumer keeps getting data. The
-# switch.is_on check is only read here as a "running continuously?" flag --
-# it does NOT re-prevent sleep (that latches once when the switch turns on).
-# In battery/duty-cycle mode (prevent_sleep off) this stays quiet and the
-# on_connect publish + deep sleep handles the one-point-per-wake cadence.
+# /state snapshot so your consumer keeps getting data. The switch is only read
+# here as a "running continuously?" flag -- it does NOT re-prevent sleep (that
+# latches once when the switch turns on). In battery/duty-cycle mode
+# (prevent_sleep off) this stays quiet and the on_connect publish + deep sleep
+# handles the one-point-per-wake cadence.
+#
+# The rate is adaptive rather than a flat 60s -- see the publish_period_*
+# substitutions at the top for the rationale and the knobs. The 1s tick is
+# scheduler granularity, not the publish rate: the lambda decides whether
+# anything is actually due, and on a green, steady device it declines 59 times
+# out of 60. Setting the tick to the slow rate instead would quantise
+# everything to it, so a band change could sit unpublished for up to a minute --
+# precisely the wait this exists to remove.
 interval:
-  - interval: 60s
+  - interval: 1s
     then:
-      - if:
-          condition:
-            switch.is_on: prevent_sleep
-          then:
-            - script.execute: reportAllValues
+      - lambda: |-
+          if (!id(prevent_sleep).state) {
+            return;
+          }
+
+          // During an event, publish faster: someone opening the dashboard
+          // wants to watch it move, and a minute-old snapshot of an event in
+          // progress is stale enough to mislead about the trend. See
+          // publish_elevated_band at the top -- it is coupled to the VOC band
+          // table, and "above green" is only a sane trigger because band 0 has
+          // been retuned to actually mean normal.
+          const int band = id(air_band_worst);
+          const uint32_t period =
+              (band >= ${publish_elevated_band} ? ${publish_period_elevated_s}
+                                               : ${publish_period_s}) * 1000UL;
+
+          // A band change jumps the queue. This cannot become a publish storm
+          // even if a reading sits on a boundary and dithers across it: bands
+          // only move when a sensor reports, and the fastest of those is 10s.
+          const uint32_t now = millis();
+          const bool changed = (band != id(publish_last_band));
+          if (!changed && (now - id(publish_last_ms)) < period) {
+            return;
+          }
+
+          // Stamped at dispatch rather than on completion, so each period is
+          // measured from a fixed point. reportAllValues takes ~500ms (it
+          // force-updates every component and waits for them before
+          // serialising); charging that to the interval would make the real
+          // cadence drift slower than the configured one.
+          id(publish_last_ms) = now;
+          id(publish_last_band) = band;
+          id(reportAllValues).execute();
 
 # Stock air-quality LED. Upstream Core.yaml drives rgb_light from ONE selected
 # metric, banded into six severity colors. "All" is a local addition and the
@@ -975,6 +1239,112 @@ script:
             id(restore_air_quality_led).execute();
           }
 
+  # Grades every air-quality channel onto one shared 0-5 severity scale and
+  # stores the results in the air_band_* globals. Pure: reads sensor states,
+  # writes globals, touches no hardware and no LED. Called from led_evaluate, so
+  # it runs on every air-quality reading (~4 channels x 10s) and its output is
+  # never more than one sample period old.
+  #
+  # This is the single source of truth for "how bad is it", consumed by
+  # update_air_quality_led (which picks one channel or the worst-of, per the
+  # source select) and by the publish-cadence interval (which always takes the
+  # worst-of). Note what it deliberately does NOT consult: LED Brightness, the
+  # source select, alarm mode, or whether the strobe is up. Those decide what
+  # the light does, not what the air is -- keeping them out is what lets the
+  # dashboard stay fast while the LED is switched off.
+  #
+  # Each metric has its own scale, but they all land on the same 0-5 band and
+  # share one colour table, which is what makes the worst-of comparison
+  # meaningful in the first place.
+  - id: compute_air_bands
+    mode: single
+    then:
+      - lambda: |-
+          // One grader for every channel, driven by the band_cuts_* arrays in
+          // globals -- see the long comment there for what each table means and
+          // where its numbers come from. Four near-identical if-chains used to
+          // live here; a loop over the shared table is what makes it possible
+          // for publish_band_config to hand consumers the same numbers instead
+          // of everyone keeping their own copy.
+          auto grade = [](float x, const int *cuts, int n) -> int {
+            if (isnan(x)) return -1;   // no reading: does not vote, never green
+            for (int i = 0; i < n; i++) {
+              if (x <= (float) cuts[i]) return i;
+            }
+            return n;                  // past the last cut = worst band
+          };
+
+          id(air_band_aqi) = grade(id(pm_aqi).state,    id(band_cuts_aqi), 5);
+          id(air_band_co2) = grade(id(co2).state,       id(band_cuts_co2), 5);
+          id(air_band_voc) = grade(id(sen55_voc).state, id(band_cuts_voc), 3);
+          id(air_band_nox) = grade(id(sen55_nox).state, id(band_cuts_nox), 4);
+
+          // Worst-of across every channel the device has, so a spike on any one
+          // of them shows up. A channel with no reading yet is -1 and simply
+          // does not vote: a warming-up SCD40 or a post-reset VOC baseline can
+          // neither pin the result at green nor invent a red. Stays -1 only
+          // while EVERY channel is unreadable.
+          id(air_band_worst) =
+              std::max(std::max(id(air_band_aqi), id(air_band_co2)),
+                       std::max(id(air_band_voc), id(air_band_nox)));
+
+  # Publishes the band tables to ${mqtt_topic}/config/bands, RETAINED, so any
+  # consumer can colour its UI from the same numbers this device grades and
+  # lights its LED with. Retained matters: a dashboard that starts hours after
+  # the device did still gets the table from the broker immediately, and a
+  # sleeping device does not leave it blind.
+  #
+  # Serialised straight out of the band_cuts_* globals -- this script contains no
+  # thresholds of its own, which is the whole point. Change a number in globals
+  # and the LED, the publish cadence and every dashboard move together.
+  #
+  # `colors` is the LED's own band palette as hex, so a consumer can match the
+  # light on the wall rather than guessing at "yellow". Band 5 is the same red as
+  # band 3 because the LED distinguishes them by brightness (see the dimming in
+  # update_air_quality_led -- normalize_color() would otherwise rescale a dark
+  # red straight back to pure red); a screen has no such constraint, hence the
+  # separate darker hex here.
+  #
+  # Deliberately no band NAMES. Upstream used EPA's category words (Good ...
+  # Hazardous), which are legally defined terms for outdoor criteria pollutants
+  # and are only meaningful for the AQI channel -- reusing them for CO2, which
+  # EPA does not regulate at all, borrows authority that does not exist. A
+  # consumer that wants words has to choose its own and own that choice.
+  - id: publish_band_config
+    mode: single
+    then:
+      - mqtt.publish_json:
+          topic: ${mqtt_topic}/config/bands
+          retain: true
+          payload: |-
+            // Upper bound INCLUSIVE: band i is the first i where value <=
+            // cuts[i], else cuts.size(). Stated in the payload so a consumer
+            // does not have to infer it or read this file.
+            root["compare"] = "lte";
+            root["bands"] = 6;
+            JsonArray aqi = root.createNestedArray("aqi");
+            for (int i = 0; i < 5; i++) aqi.add(id(band_cuts_aqi)[i]);
+            JsonArray co2 = root.createNestedArray("co2");
+            for (int i = 0; i < 5; i++) co2.add(id(band_cuts_co2)[i]);
+            // Deliberately shorter than the absolute scales: a relative
+            // deviation index must not be able to claim the top severity bands.
+            // VOC 3, NOx 4 -- see their comments in globals.
+            JsonArray voc = root.createNestedArray("voc");
+            for (int i = 0; i < 3; i++) voc.add(id(band_cuts_voc)[i]);
+            JsonArray nox = root.createNestedArray("nox");
+            for (int i = 0; i < 4; i++) nox.add(id(band_cuts_nox)[i]);
+            JsonArray colors = root.createNestedArray("colors");
+            colors.add("#00c000");  // 0
+            colors.add("#c0c000");  // 1
+            colors.add("#e08000");  // 2
+            colors.add("#e00000");  // 3
+            colors.add("#9900ff");  // 4
+            colors.add("#600000");  // 5 -- LED shows dimmed red, not a new hue
+            root["elevated_band"] = ${publish_elevated_band};
+            root["period_s"] = ${publish_period_s};
+            root["period_elevated_s"] = ${publish_period_elevated_s};
+            root["firmware_version"] = "${version}";
+
   # Stock behaviour, ported from upstream Core.yaml. Paints rgb_light with the
   # severity band of whichever metric air_quality_led_source names.
   - id: update_air_quality_led
@@ -1009,77 +1379,15 @@ script:
 
           const std::string src = id(air_quality_led_source).current_option();
 
-          // Map a metric to a severity band: 0=Good ... 5=Hazardous, or -1 for
-          // "no usable reading". Each metric has its own scale, but they all
-          // land on the same 0-5 band and share one colour table below -- which
-          // is what makes the worst-of comparison in "All" meaningful.
-          auto band_aqi = [](float x) -> int {       // US EPA AQI
-            if (isnan(x)) return -1;
-            if (x <= 50)   return 0;
-            if (x <= 100)  return 1;
-            if (x <= 150)  return 2;
-            if (x <= 200)  return 3;
-            if (x <= 300)  return 4;
-            return 5;
-          };
-          // ppm, SCD40. Retuned away from upstream's 800/1000/1500/2000/2500,
-          // which paired its top band with the name "Hazardous" at 2500ppm --
-          // an ordinary closed bedroom overnight.
+          // Bands themselves are computed by compute_air_bands off every sensor
+          // reading; this only chooses which one to paint. The strings must
+          // match the select's options EXACTLY -- an unrecognised name falls
+          // through every branch and leaves band at -1, which reads as a dark
+          // LED rather than as an error. (That is how the "NowCast AQI" ->
+          // "PM AQI" rename silently switched the LED off for anyone who had
+          // pinned it to that channel.)
           //
-          // There is NO official government severity scale for indoor CO2. EPA
-          // does not regulate it (not a criteria pollutant), and the WHO indoor
-          // air quality guidelines do not cover it. Only two ends are anchored:
-          //
-          //   800   CDC ventilation guidance for shared indoor spaces. A
-          //         ventilation-adequacy proxy, NOT a health threshold.
-          //   1100  ASHRAE comfort/odour range (~700ppm above outdoor ambient).
-          //         Also a professional-society figure, not a regulation.
-          //   5000  OSHA PEL (29 CFR 1910.1000) and NIOSH REL, 8h TWA. The one
-          //         enforceable number in the whole scale.
-          //
-          // 2000 and 3500 are interpolation between those, and are labelled in
-          // the README as judgement calls rather than guidance. The top band
-          // now coincides with the danger_co2_ppm strobe threshold instead of
-          // sitting at half of it, so "worst steady colour" means "you are at
-          // the level that trips the alarm" rather than contradicting it.
-          //
-          // Caveat that no threshold can fix: the PEL is an 8h occupational
-          // limit for healthy adult workers. This unit is in a bedroom.
-          auto band_co2 = [](float x) -> int {
-            if (isnan(x)) return -1;
-            if (x <= 800)  return 0;   // well ventilated
-            if (x <= 1100) return 1;   // acceptable
-            if (x <= 2000) return 2;   // stuffy
-            if (x <= 3500) return 3;   // poorly ventilated
-            if (x <= 5000) return 4;   // very poor
-            return 5;                  // occupational limit exceeded
-          };
-          // The two Sensirion gas indices run 1-500 and are RELATIVE to a
-          // learned baseline, so they answer "different from recent normal?"
-          // rather than "harmful?". Their top rung is "extremely abnormal",
-          // which is not a severity claim at all -- so both cap at band 4 and
-          // neither can ever drive the LED to band 5 on its own.
-          // VOC is centred on index_offset 100 (set in algorithm_tuning above);
-          // NOx uses the driver's default offset of 1, which is why its first
-          // boundary is so much lower rather than a copy-paste slip.
-          auto band_voc = [](float x) -> int {
-            if (isnan(x)) return -1;
-            if (x < 80)   return 0;
-            if (x < 150)  return 1;
-            if (x < 250)  return 2;
-            if (x < 400)  return 3;
-            return 4;
-          };
-          auto band_nox = [](float x) -> int {
-            if (isnan(x)) return -1;
-            if (x < 20)   return 0;
-            if (x < 150)  return 1;
-            if (x < 250)  return 2;
-            if (x < 400)  return 3;
-            return 4;
-          };
-
-          // Master off, folded into the head of the same chain so there is
+          // Master off is folded into the head of the same chain so there is
           // exactly one place that decides the band. Note what is NOT consulted
           // here: alarm mode. The strobe outranks this painter through the
           // air_danger_active guard above, not by suppressing it, so the two
@@ -1089,21 +1397,15 @@ script:
           if (level <= 0.0f || src == "Off") {
             band = -1;
           } else if (src == "All") {
-            // Worst-of across every air-quality channel the device has, so a
-            // spike on any one of them shows up. A channel with no reading yet
-            // returns -1 and simply does not vote: a warming-up SCD40 or a
-            // post-reset VOC baseline can neither pin the colour at green nor
-            // invent a red.
-            band = std::max(std::max(band_aqi(id(pm_aqi).state), band_co2(id(co2).state)),
-                            std::max(band_voc(id(sen55_voc).state), band_nox(id(sen55_nox).state)));
-          } else if (src == "NowCast AQI") {
-            band = band_aqi(id(pm_aqi).state);
+            band = id(air_band_worst);
+          } else if (src == "PM AQI") {
+            band = id(air_band_aqi);
           } else if (src == "CO2") {
-            band = band_co2(id(co2).state);
+            band = id(air_band_co2);
           } else if (src == "VOC Index") {
-            band = band_voc(id(sen55_voc).state);
+            band = id(air_band_voc);
           } else if (src == "NOx Index") {
-            band = band_nox(id(sen55_nox).state);
+            band = id(air_band_nox);
           }
           // band is still -1 here if every selected channel read NaN: stay dark
           // rather than hold a stale colour that would look like a measurement.
@@ -1213,14 +1515,21 @@ script:
           brightness: !lambda "return id(led_last_level);"
           transition_length: 800ms
 
-  # Re-derives the whole LED state from the current readings: alarm first, then
-  # the steady colour (which no-ops while the alarm owns the light). Hung off
-  # every air-quality sensor's on_value, so both the strobe and the colour react
-  # within one sample period instead of waiting for the 60s reportAllValues
-  # tick. Cheap enough to run that often -- two lambdas, no delays, no I/O, and
-  # both bail early when nothing has changed.
+  # Re-derives everything that depends on the current readings: grade the air,
+  # then the alarm, then the steady colour (which no-ops while the alarm owns
+  # the light). Hung off every air-quality sensor's on_value, so the strobe, the
+  # colour AND the publish cadence all react within one sample period instead of
+  # waiting for the next reportAllValues tick. Cheap enough to run that often --
+  # three lambdas, no delays, no I/O, and the last two bail early when nothing
+  # has changed.
   #
-  # mode: single is safe precisely because there are no delays here: both
+  # compute_air_bands goes first and unconditionally: the two scripts after it
+  # both have early-return guards (alarm active, statusCheck running), and the
+  # cadence must keep tracking the air through exactly those situations. Running
+  # it here rather than inside update_air_quality_led is also what keeps the
+  # bands honest when the LED is switched off entirely.
+  #
+  # mode: single is safe precisely because there are no delays here: all three
   # callees are pure lambdas that run to completion synchronously, so this can
   # never still be running when the next sensor fires. (update_air_quality_led
   # may dispatch led_pulse, which does have delays -- but execute() only
@@ -1228,6 +1537,7 @@ script:
   - id: led_evaluate
     mode: single
     then:
+      - script.execute: compute_air_bands
       - script.execute: airDangerCheck
       - script.execute: update_air_quality_led
 
@@ -1326,6 +1636,14 @@ script:
             root["nox_index"] = id(sen55_nox).state;
             root["voc_quality"] = id(voc_quality).state;
             root["aqi"] = id(pm_aqi).state;
+            // The 0-5 severity band this snapshot represents (-1 = nothing
+            // readable), worst-of across PM AQI, CO2, VOC and NOx. Published so
+            // downstream consumers do not have to re-derive it from the raw
+            // values against their own copy of the thresholds -- which is how a
+            // dashboard ends up showing green while the LED on the device is
+            // yellow. It is also what tells a consumer how fast this device is
+            // currently publishing: above 0 means the elevated rate.
+            root["air_band"] = id(air_band_worst);
             root["wifi_rssi_db"] = id(wifi_signal_db).state;
             root["esp_temperature_c"] = id(sys_esp_temperature).state;
             root["uptime_s"] = id(sys_uptime).state;

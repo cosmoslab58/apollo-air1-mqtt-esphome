@@ -55,12 +55,13 @@ from the same place, so the two stay in sync.
   "Sleep Duration" number entity), repeat. A 2-minute run-duration failsafe
   forces sleep even if MQTT never connects.
 - **Continuous (USB) mode:** `prevent_sleep` defaults on, so a freshly flashed
-  unit on USB power never deep-sleeps, and a 60s `interval:` re-publishes the
-  combined `${mqtt_topic}/state` snapshot every minute. This is the recommended
-  mode for a plugged-in monitor — the SEN55 VOC/NOx gas-index algorithm needs
-  continuous runtime to learn its baseline. Turn `prevent_sleep` off (the
-  device's web UI or its MQTT command topic) to fall back to the battery
-  duty-cycle behavior above, one publish per 5-minute wake.
+  unit on USB power never deep-sleeps, and an `interval:` re-publishes the
+  combined `${mqtt_topic}/state` snapshot on the adaptive cadence described in
+  [Publish cadence](#publish-cadence). This is the recommended mode for a
+  plugged-in monitor — the SEN55 VOC/NOx gas-index algorithm needs continuous
+  runtime to learn its baseline. Turn `prevent_sleep` off (the device's web UI
+  or its MQTT command topic) to fall back to the battery duty-cycle behavior
+  above, one publish per 5-minute wake.
 
   Note that `prevent_sleep` is `restore_mode: ALWAYS_ON` — it is **forced back
   on at every boot** and does not persist an off state. You can still turn it
@@ -97,6 +98,7 @@ with its default `esphome/apollo-air-1`.
     "nox_index": 1,
     "voc_quality": "Normal",
     "aqi": 12,
+    "air_band": 0,
     "wifi_rssi_db": -58,
     "esp_temperature_c": 34.2,
     "uptime_s": 23,
@@ -104,9 +106,49 @@ with its default `esphome/apollo-air-1`.
   }
   ```
 
+  `air_band` is the 0–5 worst-of severity band the device graded this reading
+  at (`-1` if nothing was readable) — the same number that picks the LED colour,
+  across PM AQI, CO2, VOC and NOx. It is published so consumers don't re-derive
+  it against their own copy of the thresholds, which is how a dashboard ends up
+  showing green while the LED on the device is yellow. It also tells a consumer
+  how fast this device is currently publishing: above 0 means the elevated rate.
+
   Publishing one combined message rather than ~20 per-entity ones means a
   consumer gets a complete, self-consistent reading without having to join
   topics or wait for stragglers.
+
+- **`<topic>/config/bands`** — **retained**, published on every MQTT connect.
+  The device's band tables, so a consumer colours its UI from the numbers the
+  device actually grades and lights its LED with:
+
+  ```json
+  {
+    "compare": "lte", "bands": 6,
+    "aqi": [50, 100, 150, 200, 300],
+    "co2": [800, 1100, 2000, 3500, 5000],
+    "voc": [150, 250, 400],
+    "nox": [20, 150, 250, 400],
+    "colors": ["#00c000", "#c0c000", "#e08000", "#e00000", "#9900ff", "#600000"],
+    "elevated_band": 1, "period_s": 60, "period_elevated_s": 15,
+    "firmware_version": "1.1.15-mqtt"
+  }
+  ```
+
+  `compare: "lte"` states the convention: band *i* is the first *i* where
+  `value <= cuts[i]`, else `cuts.length`. Note the arrays are different lengths:
+  five cuts for the absolute scales, three for VOC and four for NOx. That is
+  deliberate — a relative deviation index whose top rung means "extremely
+  abnormal" must not be able to claim the worst severity bands.
+
+  This exists because the dashboard used to keep its own copy of these numbers
+  and they had drifted: it banded CO2 at 1000/1500/2000, so 900ppm showed green
+  on screen while the LED was yellow. There is now one table, in
+  `band_cuts_*` in this file, and everything else reads it. Note the payload
+  carries **no band names**, for the reason given under
+  [Air quality LED](#air-quality-led): the obvious names are EPA categories
+  defined for outdoor criteria pollutants, and would be borrowed authority on a
+  CO2 or VOC reading. A consumer wanting words has to pick its own and own that
+  choice.
 
 - **`<topic>/command/ota`** — pull-OTA trigger. Publish here, never retained.
   See [Updating (OTA)](#updating-ota).
@@ -117,6 +159,73 @@ with its default `esphome/apollo-air-1`.
   and buttons (e.g. `<topic>/switch/prevent_sleep/command`). Handy for poking at
   the device with `mosquitto_sub -t '<topic>/#' -v`; not needed for the normal
   data path. Home Assistant MQTT discovery is deliberately off (`discovery: false`).
+
+### Publish cadence
+
+How often `<topic>/state` goes out, in continuous (USB) mode:
+
+| Situation | Cadence | Substitution |
+|---|---|---|
+| Worst band is 0 (green), or nothing read yet | every 60s | `publish_period_s` |
+| Worst band is 1 or above | every 15s | `publish_period_elevated_s` |
+| Worst band just *changed* (any boundary) | within 1s, at either rate | — |
+
+"Worst band" is the same 0–5 severity that colours the LED, taken across PM AQI,
+CO2, VOC and NOx. The reasoning is that a dashboard only needs to be fresh when
+something is happening: on a quiet day one point a minute is plenty, and during
+an event a minute-old snapshot is stale enough to mislead about which way the
+numbers are heading.
+
+**`publish_elevated_band` is coupled to the VOC band table — retune one, check
+the other.** "Above green" is a sane trigger only because band 0 means normal.
+With upstream's VOC first cut of 80 it was not:
+
+| Elevated threshold | VOC cut 80 | VOC cut 150 (current) |
+|---|---|---|
+| band ≥ 1 | 49.7% of time, 2.5x points/day | **5.3% of time, 1.16x** |
+| band ≥ 2 | 3.3%, 1.10x | 2.1%, 1.06x |
+
+The first column is why this threshold exists at all: at band ≥ 1 the device
+would have spent half its life at the fast rate, 94% of that being VOC idling at
+its own baseline. Raising the threshold to 2 treated the symptom; retuning the
+VOC table (see [the LED section](#why-the-voc-green-band-ends-at-150-not-80))
+fixed the cause, so the plain reading is usable again.
+
+Crossing the 0→1 boundary is never lost regardless: a band change publishes
+within a second whatever the threshold is. `publish_elevated_band` only governs
+whether the fast *steady* rate is held afterwards.
+
+The immediate publish on a band change is the part that matters most in
+practice. It means that when the LED turns yellow, the snapshot showing *why* is
+already on the broker by the time you have finished looking at the light — you
+are not waiting out the remainder of a period to see the reading that caused the
+colour you just noticed.
+
+Three things worth knowing:
+
+- **This is driven by the air, not by the LED.** The cadence reads the
+  `air_band_worst` global, which `compute_air_bands` derives from the sensors
+  alone. `LED Brightness 0` or `Air Quality LED Source: Off` gives you a dark
+  LED and unchanged data rates. The single source of truth for the band tables
+  is `compute_air_bands`, shared by both consumers, so the dashboard and the
+  light can never disagree about what band the air is in.
+- **Deep-sleep mode is unaffected.** With `prevent_sleep` off the device is
+  asleep for most of every cycle, so there is nothing to speed up — the cadence
+  is one publish per wake regardless of how bad the air is. Making a battery
+  device wake more often when the air is poor would be a real feature, but it is
+  a power-budget decision, not a dashboard one, and is not implemented.
+- **The floor is the sensors, not the interval — and it is ~5s.** Don't publish
+  faster than the hardware can measure. The binding constraint is the SCD40,
+  which produces a new sample every ~5s internally (the SEN55 manages ~1s).
+  Note that the 10s `update_interval`s in the config are *not* the limit:
+  `reportAllValues` force-updates every component before serialising, so each
+  publish triggers a fresh read whatever the polling interval says. Below ~5s
+  you would just get consecutive snapshots repeating the same CO2 number —
+  more rows, no more information. The 15s elevated rate sits ~3x above that
+  floor, so every point carries new data on every channel.
+
+Set the two substitutions equal to get a single fixed rate (upstream's
+behaviour).
 
 ## Air quality LED
 
@@ -135,14 +244,56 @@ the LED to one channel, which is what you want while calibrating or debugging
 that channel. Each metric is banded into severity levels sharing one colour
 table:
 
-| Colour | PM AQI | CO2 (ppm) | VOC Index | NOx Index |
-|---|---|---|---|---|
-| Green | ≤ 50 — Good | ≤ 800 — Well ventilated | < 80 | < 20 |
-| Yellow | ≤ 100 — Moderate | ≤ 1100 — Acceptable | < 150 | < 150 |
-| Orange | ≤ 150 — Unhealthy (sensitive) | ≤ 2000 — Stuffy | < 250 | < 250 |
-| Red | ≤ 200 — Unhealthy | ≤ 3500 — Poorly ventilated | < 400 | < 400 |
-| Purple | ≤ 300 — Very unhealthy | ≤ 5000 — Very poor | ≥ 400 | ≥ 400 |
-| Dim red | > 300 — Hazardous | > 5000 — Occupational limit | — | — |
+| Band | Colour | PM AQI | CO2 (ppm) | VOC Index | NOx Index |
+|---|---|---|---|---|---|
+| 0 | Green | ≤ 50 — Good | ≤ 800 — Well ventilated | ≤ 150 | ≤ 20 |
+| 1 | Yellow | ≤ 100 — Moderate | ≤ 1100 — Acceptable | ≤ 250 | ≤ 150 |
+| 2 | Orange | ≤ 150 — Unhealthy (sensitive) | ≤ 2000 — Stuffy | ≤ 400 | ≤ 250 |
+| 3 | Red | ≤ 200 — Unhealthy | ≤ 3500 — Poorly ventilated | > 400 | ≤ 400 |
+| 4 | Purple | ≤ 300 — Very unhealthy | ≤ 5000 — Very poor | — | > 400 |
+| 5 | Dim red | > 300 — Hazardous | > 5000 — Occupational limit | — | — |
+
+The two relative indices stop short of the top on purpose: VOC caps at band 3
+and NOx at band 4. Both are *deviation from a learned baseline*, not
+concentrations — their top rung means "extremely abnormal", which is not a
+severity claim. Letting either colour the LED the same as "hazardous" outdoor
+particulates would borrow authority neither has.
+
+These numbers live in the `band_cuts_*` globals and **nowhere else**. They grade
+the readings, set the [publish cadence](#publish-cadence), colour the LED, and
+are published verbatim on [`<topic>/config/bands`](#mqtt) for the dashboard to
+colour its own UI with. Comparison is upper-bound inclusive throughout (`value <=
+cut`); VOC and NOx used exclusive `<` until the convention was unified, so their
+boundaries moved by one index unit — immaterial on a 1–500 relative index.
+
+### Why the VOC green band ends at 150, not 80
+
+The one cut here chosen from measurement rather than a published guideline, and
+worth explaining because upstream's 80 is wrong for this sensor's own tuning.
+
+`algorithm_tuning` sets `index_offset: 100`, which means the VOC algorithm
+reports **~100 when conditions match its learned baseline**. A first cut of 80
+therefore made band 0 mean "quieter than typical" — a state a self-baselining
+index dips into and back out of constantly, and never settles in. Measured over
+2.5 days of one unit's data:
+
+| | first cut 80 (upstream) | first cut 150 |
+|---|---|---|
+| Time in band 0 | 50.3% | **94.7%** |
+| Worst-of band transitions | 38.3/day | 28.6/day |
+| Time above green | 49.7% | **5.3%** |
+
+So the LED was yellow roughly half its life by construction, and "above green"
+was useless as an event signal — which is why the publish cadence originally
+needed a band-2 threshold to work around it.
+
+Real events still register unmistakably: brewed coffee two rooms from the sensor
+took the index from ~110 to 424 in six minutes, i.e. band 3.
+
+**NOx is the control that confirms the diagnosis.** Its `index_offset` is the
+driver's default of 1, far below its first cut of 20, and it reads band 0 for 99%
+of samples with no retuning at all. The problem was never the sensor; it was a
+green band placed below the index's own resting point.
 
 **Each channel is labelled in its own terms, deliberately.** Upstream applied
 the EPA AQI category names (*Good* … *Hazardous*) across every column. Those are
