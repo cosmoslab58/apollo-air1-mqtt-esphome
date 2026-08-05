@@ -85,7 +85,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.3.1-mqtt"
+  version: "1.3.2-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -2099,12 +2099,30 @@ script:
   # things can set these -- the dashboard, the device's own web UI, and a raw
   # MQTT publish -- and an invariant only one of them respects is not one.
   #
-  # No recursion guard needed: writing night fires this again, but by then
-  # night == day and the branch is not taken. It terminates after one extra
-  # pass, always.
+  # DEFERRED BY A TICK, and that is load-bearing rather than cosmetic.
+  #
+  # This runs from a number's on_value, and in the night case it wants to write
+  # the very number whose callback it is inside. TemplateNumber::control() does
+  # its work in this order:
+  #
+  #     set_trigger_.trigger(v);            // -- we are called from in here
+  #     if (optimistic_) publish_state(v);  //    (via the state callback)
+  #     if (restore_value_) pref_.save(&v); // -- runs AFTER we return
+  #
+  # so a write issued from inside the callback completes first, and then the
+  # OUTER call resumes and saves and publishes the value we just rejected. The
+  # device ends up holding the clamped value in memory while the retained MQTT
+  # state and the flash copy both say the rejected one -- observed exactly that
+  # way: `night 80% exceeds day 41% - clamping` in the log, and the state topic
+  # still reporting 80.
+  #
+  # Letting the current call unwind first makes the clamp an ordinary outermost
+  # write, with nothing left to run after it. mode: restart because the write
+  # re-triggers this script, and a burst of slider drags should settle once.
   - id: clamp_night_to_day
-    mode: single
+    mode: restart
     then:
+      - delay: 1ms
       - lambda: |-
           const float day = id(air_quality_led_brightness).state;
           const float night = id(air_quality_led_night_brightness).state;
