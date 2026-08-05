@@ -468,9 +468,16 @@ also a thing in a room:
 | `LED Ambience` | `Off`, `Breathing`, `Steampunk` | `Off` |
 | `LED Ambience Intensity` | 0–100 % | 40 |
 
-- **Breathing** — resting respiration, ~11–14 breaths/min. Every cycle redraws
-  its own period, amplitude and inhale/hold/exhale/pause split, so no two are
-  alike; every few minutes it takes a deeper, slower sigh. Inhale and exhale are
+- **Breathing** — a sleeping adult, ~7–9 breaths/min (`breath_period_*_ms`).
+  Deliberately slower than real sleeping respiration, which runs 10–16: a light
+  is not a chest, and the same cadence that looks restful on a sleeping person
+  reads as brisk on an LED. Every cycle redraws its own period, amplitude and
+  inhale/hold/exhale/pause split, so no two are alike, though the spread is
+  tighter than a waking rhythm would be — breathing gets both slower *and* more
+  regular as someone goes under. Exhale runs longer than inhale and about a
+  fifth of the cycle is spent at rest at the bottom, which is most of what
+  separates "asleep" from "sitting quietly". Every few minutes it sighs. Inhale
+  and exhale are
   raised cosines, which puts a zero derivative at every join and makes the whole
   cycle corner-free. The asymmetry is the point: inhale is an active effort and
   quick, exhale is passive and slower, and there is a real pause at the bottom.
