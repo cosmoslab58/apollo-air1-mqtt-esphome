@@ -85,7 +85,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.3.4-mqtt"
+  version: "1.3.6-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -270,17 +270,30 @@ substitutions:
   breath_period_min_ms: "6800"
   breath_period_max_ms: "8800"
 
-  # Frame interval for both effects. 20ms (50 fps) is well past the point of
-  # visible stepping and costs almost nothing: three LEDs, a handful of floats,
-  # and no MQTT traffic at all -- addressable effects write the LED buffer
-  # directly rather than issuing a LightCall, which is the whole reason these
-  # are effects and not a script driving light.turn_on in a loop. That version
-  # would publish the light's MQTT state on every frame, forever.
-  ambience_frame_ms: "20ms"
+  # Frame interval for both effects. Costs almost nothing regardless: three
+  # LEDs, a handful of floats, and no MQTT traffic at all -- addressable effects
+  # write the LED buffer directly rather than issuing a LightCall, which is the
+  # whole reason these are effects and not a script driving light.turn_on in a
+  # loop. That version would publish the light's MQTT state on every frame.
+  #
+  # 5ms rather than the 20ms the waveforms need, because the temporal half of
+  # the dithering spends frames as its currency: it alternates between adjacent
+  # output levels, and that alternation has to sit above the band the eye reads
+  # as flicker. A WS2812 write for three LEDs is ~90us, so 200fps is under 2%
+  # of the wire. This is a request, not a guarantee -- effects run from the main
+  # loop, which WiFi and MQTT can stall -- so ambience_dither.h reports the rate
+  # it actually achieves (`[ambience]` in the logs).
+  ambience_frame_ms: "5ms"
 
 esphome:
   name: "${name}"
   friendly_name: "${friendly_name}"
+  # Sub-LSB brightness synthesis for the two ambience effects. A header rather
+  # than a third copy of the same 40 lines inside each effect lambda -- the two
+  # effects differ only in their waveform, and the part that turns a float into
+  # light is identical and fiddly enough that two copies would drift.
+  includes:
+    - ambience_dither.h
   comment: "Apollo AIR-1 (MQTT firmware, CO2 add-on installed)"
   name_add_mac_suffix: true
   project:
@@ -295,30 +308,18 @@ esphome:
           state: "${version}"
       - lambda: |-
           id(deep_sleep_1).set_sleep_duration(id(deep_sleep_sleep_duration).state * 60 * 1000);
-      # Day/night migration, once per device. See the daynight_migrated global
-      # for why a static initial_value could not do this job. Safe at priority
-      # 500: restored number states are already available here, which is what
-      # the sleep-duration line above depends on too.
-      - if:
-          condition:
-            lambda: "return !id(daynight_migrated);"
-          then:
-            - lambda: |-
-                id(daynight_migrated) = true;
-                const float day = id(air_quality_led_brightness).state;
-                if (isnan(day)) {
-                  ESP_LOGW("led", "day/night migration: no day brightness to copy, leaving night at its default");
-                  return;
-                }
-                ESP_LOGI("led", "day/night migration: seeding night brightness from day (%.0f%%)", day);
-                id(air_quality_led_night_brightness).make_call().set_value(day).perform();
-      # Evidence, not decoration. On the 1.2.1 -> 1.3.0 OTA the night brightness
-      # came back as 23% having been set to 5%, once, and did not recur on any
-      # clean reboot since. The obvious culprit was ruled out -- ESPHome keys
-      # entity preferences on fnv1_hash(object_id), which is stable across
-      # builds and does not collide for any name here -- so the cause is still
-      # unknown. Logging both restored values at boot means the next occurrence
-      # arrives with proof instead of a memory of what the slider used to say.
+      # The day/night migration that used to sit here has been REMOVED, and the
+      # reason is worth keeping. It seeded night from day on a device that had
+      # no stored night value, because the alternative then was a fixed
+      # initial_value of 100 -- which on a unit dimmed to 41% would have made
+      # the LED brighter at night on the very update that added night dimming.
+      #
+      # The night default is now a deliberate 21%, measured in the room rather
+      # than picked as a round number, so seeding from day would override a
+      # considered default with an unrelated one. The failure it guarded against
+      # cannot happen either: a default BELOW the day value cannot brighten
+      # anything, and if someone's day sits under 21 the clamp pulls night down
+      # to meet it. The guard outlived its hazard.
       - lambda: |-
           ESP_LOGI("led", "restored brightness: day %.0f%%, night %.0f%%",
                    id(air_quality_led_brightness).state,
@@ -572,32 +573,6 @@ globals:
     type: int
     initial_value: "-1"
 
-  # One-shot marker for the day/night migration in on_boot. Restored, so it
-  # survives reboots and the migration runs exactly once per device, ever.
-  #
-  # Why it exists: "LED Night Brightness" ships with initial_value 100, and a
-  # new entity has nothing in flash to restore, so the FIRST boot after the OTA
-  # that introduced it comes up at 100 regardless of what the device was
-  # actually set to. On a unit dimmed to 41% that is not the no-op it looks
-  # like -- it is the LED getting BRIGHTER at night, which is precisely
-  # backwards for the feature being added. (Observed on exactly that unit.)
-  #
-  # So the honest default for night is not a constant at all: it is whatever
-  # day is, which makes the interpolation flat and the OTA genuinely invisible
-  # until someone chooses a night level. That cannot be expressed as a static
-  # initial_value, hence this.
-  - id: daynight_migrated
-    restore_value: yes
-    type: bool
-    initial_value: "false"
-
-  # Whether the selection and the current band say an ambience effect should be
-  # running. Written by update_air_quality_led (the only place that knows the
-  # band it just painted) and read by apply_led_ambience, so the headroom in the
-  # brightness and the effect on the light are always the same decision.
-  #
-  # Not restored: it is derived from live readings and a select, both of which
-  # are re-evaluated within a sample period of boot.
   - id: led_ambience_active
     restore_value: no
     type: bool
@@ -878,7 +853,7 @@ select:
     # and ESPHome logs "no such effect" and leaves the light alone on a
     # mismatch. "Off" is the one value that is not an effect name; it maps to
     # ESPHome's built-in "None".
-    initial_option: "Off"
+    initial_option: "Breathing"
     on_value:
       then:
         # apply_led_state, NOT apply_led_ambience directly. Selecting an effect
@@ -914,7 +889,9 @@ number:
     min_value: 0
     max_value: 100
     step: 1
-    initial_value: 100
+    # Measured in the room this unit lives in, not a round number: 33% is where
+    # the indicator is readable across the room without being a presence.
+    initial_value: 33
     mode: slider
     on_value:
       then:
@@ -937,12 +914,11 @@ number:
   # feature about dimming. It keeps its name and quietly becomes the daytime
   # value; the dashboard labels the pair "Day" and "Night".
   #
-  # initial_value 100 only makes this a no-op on a device that was already at
-  # 100. On any other, a new entity with nothing in flash to restore would come
-  # up at 100 and make the LED BRIGHTER at night than it was before the update.
-  # The real default for night is "whatever day is", which is not a constant --
-  # the one-shot migration in on_boot seeds it, so the OTA is invisible until
-  # someone chooses a night level. See the daynight_migrated global.
+  # The default is deliberately BELOW the day default rather than equal to it.
+  # An earlier version shipped 100 here and seeded night from day on first boot
+  # to avoid making the LED brighter at night on the update that added night
+  # dimming; a default under day makes that impossible by construction, and the
+  # clamp handles the case where someone's day sits lower still.
   #
   # There is no separate enable switch for the same reason there is no separate
   # LED on/off switch -- night == day IS off, and 0 is a genuinely dark night.
@@ -957,7 +933,9 @@ number:
     min_value: 0
     max_value: 100
     step: 1
-    initial_value: 100
+    # Dim enough for a bedroom, still bright enough that the ambience effects
+    # have PWM steps to work with. Below ~20% they run out of resolution.
+    initial_value: 21
     mode: slider
     on_value:
       then:
@@ -989,7 +967,7 @@ number:
     min_value: 0
     max_value: 100
     step: 1
-    initial_value: 40
+    initial_value: 47
     mode: slider
     on_value:
       then:
@@ -1482,39 +1460,15 @@ light:
 
             const float m = 1.0f - depth * (1.0f - w);
 
-            // ---- SPATIAL DITHER (keep in step with Steampunk below) --------
-            // The modulation is a float; the output is 8-bit, and the gamma
-            // stage crushes the low end, so a dim LED has very few PWM values
-            // to move through -- 16 across the whole swing at 41% brightness,
-            // and TWO at 12%. That is what makes the effect visibly step.
-            //
-            // The strip has three LEDs and the eye sums them, so the cluster
-            // can sit BETWEEN two output levels by putting some LEDs on one
-            // and the rest on the next. Round m to a whole buffer value, then
-            // give the remainder to a proportion of the LEDs. Measured against
-            // ESPHome's exact chain, this roughly triples the distinct cluster
-            // levels: 16 -> 46 at 41% brightness, 43 -> 127 at 60%.
-            //
-            // Deliberately dithered in BUFFER space rather than in output
-            // space. Output-space dithering needs this lambda to know the
-            // gamma exponent and invert it, and its rounding turns out to
-            // collapse both endpoints onto the same PWM value at high
-            // brightness -- and worse, it can make the ramp non-monotonic,
-            // which reads as jitter. The output stage is monotone in the
-            // buffer value, so doing it here is smooth by construction (zero
-            // inversions when swept) and needs to know nothing about gamma.
-            //
-            // No rotation of which LEDs get the brighter value: the remainder
-            // sweeps continuously while the effect runs, so no LED is
-            // favoured for long, and the difference is one buffer step.
-            const float qf = 255.0f * m;
-            const int q_lo = (int) qf;
-            const int q_hi = (q_lo < 255) ? q_lo + 1 : 255;
-            const int n = it.size();
-            const int n_hi = (int) lroundf((qf - q_lo) * n);
-            for (int i = 0; i < n; i++) {
-              it[i] = current_color * (uint8_t) ((i < n_hi) ? q_hi : q_lo);
+            // Spatial + temporal dithering, so the seven-second curve is not
+            // quantised onto the five PWM values a dim LED actually has. Each
+            // effect keeps its own carry, so switching between them does not
+            // inherit the other's residual. See ambience_dither.h.
+            static ambience::DitherState dither;
+            if (initial_run) {
+              dither.err = 0.0f;
             }
+            ambience::emit(it, current_color, m, dither);
       - addressable_lambda:
           name: "Steampunk"
           update_interval: ${ambience_frame_ms}
@@ -1603,19 +1557,12 @@ light:
 
             const float m = 1.0f - depth * (1.0f - w);
 
-            // ---- SPATIAL DITHER (identical to Breathing above, where the
-            // reasoning is written out) ------------------------------------
-            // Spread the fractional part of the modulation across the strip so
-            // the cluster can sit between two output levels. Buffer space, not
-            // output space, so it stays monotone and gamma-agnostic.
-            const float qf = 255.0f * m;
-            const int q_lo = (int) qf;
-            const int q_hi = (q_lo < 255) ? q_lo + 1 : 255;
-            const int n = it.size();
-            const int n_hi = (int) lroundf((qf - q_lo) * n);
-            for (int i = 0; i < n; i++) {
-              it[i] = current_color * (uint8_t) ((i < n_hi) ? q_hi : q_lo);
+            // Its own carry, separate from Breathing's. See ambience_dither.h.
+            static ambience::DitherState dither;
+            if (initial_run) {
+              dither.err = 0.0f;
             }
+            ambience::emit(it, current_color, m, dither);
 
 button:
   - platform: restart
@@ -2242,6 +2189,11 @@ script:
 
           const bool want_effect =
               id(led_ambience_active) && !id(air_danger_active) && id(rgb_light).remote_values.is_on();
+
+          // The dithering needs frames faster than ESPHome's default 16ms loop
+          // gate allows. Tied to the effect rather than left on, so the cost is
+          // paid only while something is using it. See ambience_dither.h.
+          ambience::set_fast_loop(want_effect);
 
           if (!want_effect) {
             // Nothing to do unless an ambience effect is actually up. Checking

@@ -523,17 +523,52 @@ effects and not a script driving `light.turn_on` in a loop:
 - Correction order is scale-by-brightness *then* gamma, so the modulation needs
   no gamma compensation of its own to look linear.
 
-Two limits worth knowing:
+**An effect can only scale down.** The hue arrives with its brightest channel
+already at 255. For the swing to sit *around* the setpoint rather than only
+below it, `update_air_quality_led` raises the level by half the depth and lets
+the effect take the difference back. At or near 100 % brightness there is no
+headroom to raise into, so the swing quietly becomes downward-only.
 
-- **An effect can only scale down.** The hue arrives with its brightest channel
-  already at 255. For the swing to sit *around* the setpoint rather than only
-  below it, `update_air_quality_led` raises the level by half the depth and lets
-  the effect take the difference back. At or near 100 % brightness there is no
-  headroom to raise into, so the swing quietly becomes downward-only.
-- **Low brightness bands.** At a night level of a few percent the correction
-  leaves only a handful of pre-gamma steps and gamma compresses them further, so
-  both effects will step visibly. That is an 8-bit output limit; they are at
-  their best at moderate brightness.
+### Dithering, and why it is needed
+
+A WS2812 channel is 8 bits and the gamma stage spends most of that range at the
+top, so a *comfortable* indoor brightness is a very small PWM number. At 33 % the
+LED runs at **11/255**, and the whole breathing swing covers 7–11 — five distinct
+levels for a seven-second curve. That, not the waveforms, is what makes an
+undithered effect look choppy.
+
+Lowering `gamma_correct` does not help, and it is worth knowing why because it is
+the obvious first idea: perceived brightness is a function of PWM alone, so
+"comfortable" *is* PWM 11 whatever number the slider shows. Gamma only relabels
+the control. `ambience_dither.h` synthesises the missing levels two ways:
+
+- **Spatial** — the strip has three LEDs and the eye sums them, so the cluster
+  can sit between two PWM values by putting some LEDs on one and the rest on the
+  next.
+- **Temporal** — alternating across frames faster than the eye integrates puts
+  the cluster between two of *those* values. Together they turn a 13-step
+  staircase into a continuum.
+
+Both are done in **output** space, straddling a real PWM step, because the
+buffer→PWM map is a staircase with ~3-wide treads at this brightness — dithering
+the buffer value spends most of its time moving within one tread and changing
+nothing. The step positions are *measured* (`ESPColorView` applies the correction
+on assignment and `get_*_raw()` hands back the byte that reaches the LED) rather
+than calculated, so nothing here has to reproduce ESPHome's gamma exponent, table
+and rounding, or be silently wrong the day someone sets `gamma_correct`.
+
+The temporal half needs frames, and ESPHome gates the component phase on a 16 ms
+loop interval by default — a hard ceiling of **62 fps**, measured rather than
+assumed (the first build asked for 5 ms frames and logged 62 fps for half an
+hour). At 62 fps the alternation lands at up to 31 Hz with residuals reaching
+single digits, which is exactly the band the eye reads as flicker. So an active
+effect takes a `HighFrequencyLoopRequester`, which lifts the gate and yields the
+requested ~200 fps; it is released the moment the effect stops, since running the
+core continuously is the one thing here with a real power cost. The rate actually
+achieved is logged under `[ambience]`.
+
+**It does not rescue very dim settings.** At 12 % the LED is at 0.7/255 duty and
+there is nothing there to divide.
 
 With an effect running, a band change fades its *brightness* but snaps its
 *hue*: `AddressableLightTransformer` lerps the colour values rather than the
