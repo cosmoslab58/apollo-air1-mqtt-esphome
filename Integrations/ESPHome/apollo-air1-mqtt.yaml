@@ -63,6 +63,14 @@
 #     dimming schedule pushed from outside would have to overwrite the
 #     brightness setpoint to apply, which is the one place the user's own
 #     preference is stored. See the day/night substitutions below.
+#   - Ambience effects: two decorative modulations of the steady colour --
+#     "Breathing" (asymmetric, slightly irregular, with occasional sighs) and
+#     "Steampunk" (a slow quasi-periodic furnace glow). Both are
+#     `addressable_lambda` effects, so they write the LED buffer directly and
+#     add no MQTT traffic at all; both scale the colour the band painter
+#     already set, so neither needs any knowledge of the bands, the day/night
+#     ramp or the brightness. They stand down above `ambience_max_band` and
+#     while the danger alarm is up, so decoration never softens a warning.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
 #     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
@@ -77,7 +85,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.2.1-mqtt"
+  version: "1.3.1-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -225,6 +233,33 @@ substitutions:
   # kept as the second entry either way, so a dead LAN server still resolves.
   ntp_server: "pool.ntp.org"
 
+  # --- Ambience effects ------------------------------------------------------
+  # Two decorative brightness effects -- "Breathing" and "Steampunk" -- that
+  # modulate the steady band colour without changing what it means. Selected by
+  # the "LED Ambience" select; depth set by "LED Ambience Intensity".
+  #
+  # ambience_depth_max is the modulation depth at intensity 100, as a fraction
+  # of the current brightness. 0.35 means the light swings across 35% of its
+  # level -- roughly +/-17.5% either side of the setpoint, which reads as
+  # movement without reading as a fault. Raise it for something theatrical.
+  #
+  # ambience_max_band is the WORST severity band at which ambience still runs.
+  # 1 = green and yellow only; from orange (2) up the light goes back to a
+  # steady colour. A warning that is also gently pulsing reads as less urgent
+  # than one that is not, and this device's whole premise is that the light on
+  # the wall means something. Set to 5 to keep the effect running at every
+  # band, or 0 to restrict it to green.
+  ambience_depth_max: "0.35"
+  ambience_max_band: "1"
+
+  # Frame interval for both effects. 20ms (50 fps) is well past the point of
+  # visible stepping and costs almost nothing: three LEDs, a handful of floats,
+  # and no MQTT traffic at all -- addressable effects write the LED buffer
+  # directly rather than issuing a LightCall, which is the whole reason these
+  # are effects and not a script driving light.turn_on in a loop. That version
+  # would publish the light's MQTT state on every frame, forever.
+  ambience_frame_ms: "20ms"
+
 esphome:
   name: "${name}"
   friendly_name: "${friendly_name}"
@@ -259,6 +294,17 @@ esphome:
                 }
                 ESP_LOGI("led", "day/night migration: seeding night brightness from day (%.0f%%)", day);
                 id(air_quality_led_night_brightness).make_call().set_value(day).perform();
+      # Evidence, not decoration. On the 1.2.1 -> 1.3.0 OTA the night brightness
+      # came back as 23% having been set to 5%, once, and did not recur on any
+      # clean reboot since. The obvious culprit was ruled out -- ESPHome keys
+      # entity preferences on fnv1_hash(object_id), which is stable across
+      # builds and does not collide for any name here -- so the cause is still
+      # unknown. Logging both restored values at boot means the next occurrence
+      # arrives with proof instead of a memory of what the slider used to say.
+      - lambda: |-
+          ESP_LOGI("led", "restored brightness: day %.0f%%, night %.0f%%",
+                   id(air_quality_led_brightness).state,
+                   id(air_quality_led_night_brightness).state);
       - if:
           condition:
             switch.is_on: prevent_sleep
@@ -527,6 +573,18 @@ globals:
     type: bool
     initial_value: "false"
 
+  # Whether the selection and the current band say an ambience effect should be
+  # running. Written by update_air_quality_led (the only place that knows the
+  # band it just painted) and read by apply_led_ambience, so the headroom in the
+  # brightness and the effect on the light are always the same decision.
+  #
+  # Not restored: it is derived from live readings and a select, both of which
+  # are re-evaluated within a sample period of boot.
+  - id: led_ambience_active
+    restore_value: no
+    type: bool
+    initial_value: "false"
+
   # ===========================================================================
   # THE BAND TABLES. This is the single source of truth for "how bad is it" on
   # this device, and there is deliberately no second copy anywhere -- not in
@@ -778,6 +836,43 @@ select:
       then:
         - script.execute: update_air_quality_led
 
+  # Decorative modulation of the steady colour. Mutually exclusive by
+  # construction rather than by choice: ESPHome runs at most one light effect at
+  # a time, so a pair of independent on/off switches would be a control that
+  # cannot represent its own state. A select says what is actually true.
+  #
+  # These change only HOW BRIGHT the band colour is, moment to moment -- never
+  # which colour, never the band, never the publish cadence. The colour still
+  # means exactly what the band table says it means.
+  #
+  # Same restore_value-stores-the-INDEX warning as the select above: append new
+  # options at the END.
+  - platform: template
+    name: "LED Ambience"
+    id: led_ambience
+    icon: mdi:waveform
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    options: ["Off", "Breathing", "Steampunk"]
+    # The option names must match the effect names in the light: block below
+    # EXACTLY -- apply_led_ambience passes this string straight to set_effect,
+    # and ESPHome logs "no such effect" and leaves the light alone on a
+    # mismatch. "Off" is the one value that is not an effect name; it maps to
+    # ESPHome's built-in "None".
+    initial_option: "Off"
+    on_value:
+      then:
+        # apply_led_state, NOT apply_led_ambience directly. Selecting an effect
+        # changes two things -- whether an effect runs AND the brightness
+        # headroom it needs -- and only update_air_quality_led can work out the
+        # second, because only it knows the band. Calling the ambience script on
+        # its own leaves led_ambience_active stale until the next sensor
+        # reading, which showed up as the select taking up to ~10s to act, and
+        # then only sometimes. This is the same full re-derive the brightness
+        # sliders use.
+        - script.execute: apply_led_state
+
 number:
   - platform: template
     name: "LED Brightness"
@@ -805,6 +900,9 @@ number:
     mode: slider
     on_value:
       then:
+        # Lowering day below night has to bring night down with it, or the pair
+        # would be left in a state the ramp cannot express. See the script.
+        - script.execute: clamp_night_to_day
         - script.execute: apply_led_state
 
   # Night half of the pair above. The two are interpolated by the sun's
@@ -845,6 +943,41 @@ number:
     mode: slider
     on_value:
       then:
+        # Night above day is not a configuration, it is a contradiction: the
+        # ramp would brighten the LED at dusk. Enforced here rather than only in
+        # the dashboard because three things can set this -- the dashboard, the
+        # device's own web UI, and a raw MQTT publish -- and an invariant that
+        # only one of them respects is not an invariant.
+        - script.execute: clamp_night_to_day
+        - script.execute: apply_led_state
+
+  # Depth of the ambience modulation, as a percentage of ambience_depth_max.
+  # Deliberately a percentage of a compile-time ceiling rather than a raw
+  # percentage of brightness: the ceiling is where the judgement about "how far
+  # is too far" lives, in one place, next to its reasoning.
+  #
+  # 0 leaves the effect selected but flat, which is a legitimate place to sit
+  # while deciding -- unlike LED Brightness, 0 here is not a master off. The
+  # select is the master off, because "no effect" and "an effect of no depth"
+  # are genuinely different states and the LED Ambience select can say which.
+  - platform: template
+    name: "LED Ambience Intensity"
+    id: led_ambience_intensity
+    icon: mdi:sine-wave
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 40
+    mode: slider
+    on_value:
+      then:
+        # No effect restart needed -- both effects read this live, every frame.
+        # apply_led_state re-derives the brightness, which matters because the
+        # headroom the effect modulates within is a function of this depth.
         - script.execute: apply_led_state
 
   - platform: template
@@ -1207,6 +1340,205 @@ light:
               duration: 150ms
             - state: false
               duration: 60ms
+
+      # ---------------------------------------------------------------------
+      # AMBIENCE EFFECTS. Appended at the END so the indices of everything
+      # above are untouched (the MQTT light state reports effect_index, and
+      # deployed consumers may have learned them).
+      #
+      # How these compose with everything else, which is the whole reason they
+      # are effects rather than a script driving light.turn_on:
+      #
+      #   - `current_color` arrives as the band hue with the master brightness
+      #     NOT applied -- AddressableLight::update_state pushes brightness into
+      #     the colour correction (`set_local_brightness`) and only then returns
+      #     early for the active effect. So scaling `current_color` by m does
+      #     exactly what moving the brightness slider to m would do, and the
+      #     day/night ramp, the band-5 dimming and led_pulse all keep working
+      #     underneath without either effect knowing they exist.
+      #   - Correction order is scale-by-brightness THEN gamma, so m needs no
+      #     gamma compensation of its own to look linear.
+      #   - An effect can only ever scale DOWN: the hue arrives with its
+      #     brightest channel already at 255. Swinging symmetrically around the
+      #     setpoint therefore needs headroom, which update_air_quality_led
+      #     provides by raising the level by half the depth (and clamping at
+      #     full, where the swing quietly becomes downward-only).
+      #
+      # Both effects hold their state in `static` locals reset on initial_run,
+      # which is the documented addressable_lambda pattern -- the lambda is
+      # compiled as a plain function, so there is nowhere else to put it.
+      #
+      # KNOWN LIMIT: at very low brightness (a night level of a few percent)
+      # local_brightness leaves only a handful of pre-gamma steps, and gamma
+      # compresses them further, so both effects will band visibly. That is an
+      # 8-bit output limit, not a bug in the maths -- they are at their best at
+      # moderate brightness.
+      - addressable_lambda:
+          name: "Breathing"
+          update_interval: ${ambience_frame_ms}
+          lambda: |-
+            // Resting adult respiration: ~11-14 breaths/min, asymmetric, and
+            // never twice the same. The asymmetry is what makes it read as
+            // breathing rather than as a sine wave -- inhale is an active
+            // muscular effort and is quick; exhale is largely passive and takes
+            // longer; and there is a real pause at the bottom before the next
+            // one starts. A symmetric waveform reads as a machine.
+            static uint32_t breath_start = 0;
+            static float breath_period = 0.0f;
+            static float breath_amp = 1.0f;
+            static float frac_in = 0.36f, frac_hold = 0.06f, frac_ex = 0.44f;
+            static int breaths_until_sigh = 0;
+
+            const float PI_F = 3.14159265f;
+            const uint32_t now = millis();
+
+            if (initial_run) {
+              breath_period = 0.0f;      // forces a fresh cycle immediately
+              breaths_until_sigh = 0;    // and makes the first breath a sigh
+            }
+
+            float elapsed = (float) (now - breath_start);
+            if (breath_period <= 0.0f || elapsed >= breath_period) {
+              breath_start = now;
+              elapsed = 0.0f;
+
+              // Every parameter is redrawn per breath. Real breathing varies
+              // cycle to cycle (respiratory sinus arrhythmia is not subtle),
+              // and a fixed period is the single thing that would give this
+              // away as a loop.
+              breath_period = 4200.0f + random_float() * 1200.0f;   // 11-14/min
+              breath_amp = 0.88f + random_float() * 0.24f;
+              frac_in   = 0.36f + (random_float() - 0.5f) * 0.06f;
+              frac_hold = 0.06f + (random_float() - 0.5f) * 0.03f;
+              frac_ex   = 0.44f + (random_float() - 0.5f) * 0.06f;
+
+              if (breaths_until_sigh <= 0) {
+                // A sigh. Humans take one every few minutes without noticing;
+                // it is the detail that stops a long look at this feeling
+                // mechanical. Deeper AND slower -- scaling only the depth
+                // reads as a twitch.
+                breath_amp *= 1.5f;
+                breath_period *= 1.25f;
+                breaths_until_sigh = 40 + (int) (random_float() * 40.0f);
+              } else {
+                breaths_until_sigh--;
+              }
+            }
+
+            // w: 0 = empty, 1 = full. Both curves are raised cosines, so the
+            // derivative is zero at every join -- inhale into hold, hold into
+            // exhale, exhale into pause, pause into the next inhale. That is
+            // what makes the whole cycle C1-continuous with no visible corner.
+            const float u = elapsed / breath_period;
+            float w;
+            if (u < frac_in) {
+              w = 0.5f - 0.5f * cosf(PI_F * (u / frac_in));
+            } else if (u < frac_in + frac_hold) {
+              w = 1.0f;
+            } else if (u < frac_in + frac_hold + frac_ex) {
+              w = 0.5f + 0.5f * cosf(PI_F * ((u - frac_in - frac_hold) / frac_ex));
+            } else {
+              w = 0.0f;
+            }
+
+            // Depth scales with the breath, so a sigh genuinely swings wider
+            // rather than just lasting longer. Clamped well clear of 1.0: at
+            // depth 1 the trough is black, which is not breathing, it is a
+            // blink.
+            float depth = (id(led_ambience_intensity).state / 100.0f) * ${ambience_depth_max} * breath_amp;
+            if (depth > 0.85f) depth = 0.85f;
+            if (depth < 0.0f) depth = 0.0f;
+
+            const float m = 1.0f - depth * (1.0f - w);
+            it.all() = current_color * (uint8_t) (m * 255.0f);
+      - addressable_lambda:
+          name: "Steampunk"
+          update_interval: ${ambience_frame_ms}
+          lambda: |-
+            // A firebox seen through a viewport: a slow, warm, wandering glow
+            // with the occasional swell as something vents. Smooth by
+            // construction rather than by filtering -- every term below is a
+            // cosine or a raised-cosine interpolation, so the sum is C1 at
+            // worst and there is nothing to smooth out.
+            //
+            // Deliberately NOT ESPHome's built-in `flicker`, which is per-frame
+            // noise. Noise reads as a loose connection; this should read as
+            // something large and hot changing its mind slowly.
+            static uint32_t t_start = 0;
+            static float walk_from = 0.0f, walk_to = 0.0f;
+            static uint32_t walk_start = 0, walk_len = 2000;
+            static uint32_t surge_start = 0, surge_len = 0, surge_next = 0;
+            static bool surging = false;
+
+            const float PI_F = 3.14159265f;
+            const uint32_t now = millis();
+
+            if (initial_run) {
+              t_start = now;
+              walk_from = 0.0f;
+              walk_to = 0.0f;
+              walk_start = now;
+              walk_len = 2000;
+              surging = false;
+              surge_next = now + 6000;
+            }
+
+            const float t = (float) (now - t_start) / 1000.0f;
+
+            // Three sines whose periods share no common multiple, so the sum
+            // never repeats -- quasi-periodic motion that looks improvised
+            // while costing three cosines a frame. The phase offsets stop them
+            // all starting aligned, which would open with an obvious throb.
+            const float s = 0.50f * sinf(2.0f * PI_F * t / 3.1f)
+                          + 0.30f * sinf(2.0f * PI_F * t / 5.7f + 1.7f)
+                          + 0.20f * sinf(2.0f * PI_F * t / 9.4f + 3.9f);
+
+            // Genuine randomness on top of the deterministic sines: re-target
+            // every 1.5-3s and ease across with a raised cosine, so the walk
+            // itself has no corners.
+            if (now - walk_start >= walk_len) {
+              walk_from = walk_to;
+              walk_to = (random_float() - 0.5f) * 0.30f;
+              walk_start = now;
+              walk_len = 1500 + (uint32_t) (random_float() * 1500.0f);
+            }
+            const float wu = (float) (now - walk_start) / (float) walk_len;
+            const float walk = walk_from + (walk_to - walk_from) * (0.5f - 0.5f * cosf(PI_F * wu));
+
+            // The vent. A single full raised-cosine bump, so it rises out of
+            // and settles back into the ambient motion without a seam. This is
+            // the beat that gives the effect a sense of machinery rather than
+            // weather.
+            float surge = 0.0f;
+            if (!surging && now >= surge_next) {
+              surging = true;
+              surge_start = now;
+              surge_len = 1500 + (uint32_t) (random_float() * 1500.0f);
+            }
+            if (surging) {
+              const float su = (float) (now - surge_start) / (float) surge_len;
+              if (su >= 1.0f) {
+                surging = false;
+                surge_next = now + 12000 + (uint32_t) (random_float() * 13000.0f);
+              } else {
+                surge = 0.35f * (0.5f - 0.5f * cosf(2.0f * PI_F * su));
+              }
+            }
+
+            // A whisper of faster movement. Small enough not to read as
+            // flicker, present enough that the glow is never quite still.
+            const float shimmer = 0.05f * sinf(2.0f * PI_F * t / 0.73f);
+
+            float w = 0.5f + 0.5f * s + walk + surge + shimmer;
+            if (w > 1.0f) w = 1.0f;
+            if (w < 0.0f) w = 0.0f;
+
+            float depth = (id(led_ambience_intensity).state / 100.0f) * ${ambience_depth_max};
+            if (depth > 0.85f) depth = 0.85f;
+            if (depth < 0.0f) depth = 0.0f;
+
+            const float m = 1.0f - depth * (1.0f - w);
+            it.all() = current_color * (uint8_t) (m * 255.0f);
 
 button:
   - platform: restart
@@ -1670,6 +2002,34 @@ script:
           if (band == 5) {
             level *= 0.45f;
           }
+
+          // Ambience headroom. An addressable effect can only scale the colour
+          // DOWN -- the hue arrives with its brightest channel already at 255 --
+          // so for the modulation to swing symmetrically ABOUT the setpoint
+          // rather than only below it, the light has to sit half a depth above
+          // it and let the effect take back the difference. Same shape as the
+          // band-5 multiplier above, and applied in the same place so the
+          // cached level still describes what was really sent.
+          //
+          // Clamped at full, where the swing quietly degrades to downward-only.
+          // That is the honest failure: at 100% brightness there is no headroom
+          // to be had, and the alternative -- silently lowering the setpoint to
+          // make room -- would be the feature editing a setting the user owns.
+          //
+          // Decided HERE, and stored, rather than re-derived in
+          // apply_led_ambience: both need the same answer, and the band is a
+          // local that only exists in this pass. Two copies of this condition
+          // would eventually disagree, and the visible symptom would be an LED
+          // sitting permanently half a depth too bright with no effect running.
+          id(led_ambience_active) =
+              (id(led_ambience).current_option() != "Off") &&
+              band >= 0 && band <= ${ambience_max_band};
+          if (id(led_ambience_active)) {
+            const float depth = (id(led_ambience_intensity).state / 100.0f) * ${ambience_depth_max};
+            level *= (1.0f + depth * 0.5f);
+            if (level > 1.0f) level = 1.0f;
+          }
+
           if (band < 0) {
             level = 0.0f;
           }
@@ -1729,6 +2089,86 @@ script:
             // no longer means what the pulse was announcing.
             id(led_pulse).stop();
           }
+
+  # Night must never be brighter than day. Called from BOTH brightness numbers'
+  # on_value, which is what makes one rule cover both directions: raising night
+  # past day pulls it back, and lowering day below night drags night down with
+  # it. Either way the pair converges on night == day.
+  #
+  # Enforced on the device rather than only in the dashboard because three
+  # things can set these -- the dashboard, the device's own web UI, and a raw
+  # MQTT publish -- and an invariant only one of them respects is not one.
+  #
+  # No recursion guard needed: writing night fires this again, but by then
+  # night == day and the branch is not taken. It terminates after one extra
+  # pass, always.
+  - id: clamp_night_to_day
+    mode: single
+    then:
+      - lambda: |-
+          const float day = id(air_quality_led_brightness).state;
+          const float night = id(air_quality_led_night_brightness).state;
+          if (isnan(day) || isnan(night) || night <= day) {
+            return;
+          }
+          ESP_LOGI("led", "night brightness %.0f%% exceeds day %.0f%% - clamping to day", night, day);
+          id(air_quality_led_night_brightness).make_call().set_value(day).perform();
+
+  # Puts the selected ambience effect on the light, or takes it off. The only
+  # place that calls set_effect for ambience.
+  #
+  # Everything that can own the LED outranks this, and each is a separate
+  # clause rather than one combined test because they become true for
+  # different reasons:
+  #
+  #   - the danger strobe IS an effect, and ESPHome runs one at a time, so
+  #     starting ambience during an alarm would silently cancel the alarm;
+  #   - statusCheck and testScript paint the light directly and would be
+  #     modulated underneath;
+  #   - a dark LED has nothing to modulate. update_air_quality_led's turn_off()
+  #     already clears the effect for us (LightCall auto-stops effects on an
+  #     explicit turn off), so this only has to decline to start one.
+  #
+  # The get_effect_name() check is not an optimisation, it is what keeps this
+  # callable from led_evaluate -- i.e. on every sensor reading, several times a
+  # minute. A LightCall publishes the light's MQTT state whether or not anything
+  # changed, so without this the broker would carry a steady drip of identical
+  # messages for a light that is doing exactly what it was already doing.
+  - id: apply_led_ambience
+    mode: single
+    then:
+      - lambda: |-
+          if (millis() < 5000) {
+            return;
+          }
+          if (id(statusCheck).is_running() || id(testScript).is_running()) {
+            return;
+          }
+
+          const bool want_effect =
+              id(led_ambience_active) && !id(air_danger_active) && id(rgb_light).remote_values.is_on();
+
+          if (!want_effect) {
+            // Nothing to do unless an ambience effect is actually up. Checking
+            // the name rather than a flag means a strobe raised underneath us
+            // is left alone -- clearing "the effect" unconditionally here would
+            // cancel the alarm.
+            const auto cur = id(rgb_light).get_effect_name();
+            if (cur == "None" || cur == "Air Danger" || !id(rgb_light).remote_values.is_on()) {
+              return;
+            }
+            id(rgb_light).turn_on().set_effect("None").perform();
+            return;
+          }
+
+          const std::string want = id(led_ambience).current_option();
+          if (id(rgb_light).get_effect_name() == want) {
+            return;
+          }
+          // Effect and transition cannot share a LightCall (ESPHome rejects the
+          // pair), which is why this is its own call rather than something
+          // update_air_quality_led folds into the repaint it just did.
+          id(rgb_light).turn_on().set_effect(want).perform();
 
   # Day/night ramp. The ONLY writer of sun_day_factor: it maps the sun's
   # elevation onto 0.0 (night) .. 1.0 (day) and hands the repaint to
@@ -1862,6 +2302,10 @@ script:
       - script.execute: compute_air_bands
       - script.execute: airDangerCheck
       - script.execute: update_air_quality_led
+      # Last, and after the painter: it consumes led_ambience_active, which
+      # update_air_quality_led has just derived from the band it painted. Its
+      # own dedup makes running it this often free.
+      - script.execute: apply_led_ambience
 
   # Short delay so the caller's own light action lands first and
   # update_air_quality_led's is_running() guard passes. mode: restart so a
@@ -1890,6 +2334,11 @@ script:
       - lambda: "id(led_last_band) = -2;"
       - delay: 200ms
       - script.execute: update_air_quality_led
+      # This is the universal hand-back path, so it is also where ambience comes
+      # back after whatever took the light away -- an alarm clearing, a status
+      # flash ending, a mode change. Without it the LED would return to the
+      # right colour with the effect silently dropped.
+      - script.execute: apply_led_ambience
 
   - id: statusCheck
     then:

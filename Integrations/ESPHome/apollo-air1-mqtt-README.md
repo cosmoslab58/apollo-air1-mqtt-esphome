@@ -437,6 +437,12 @@ Two things to know:
   on/off switch. Equal setpoints *is* off: the interpolation between two equal
   endpoints is flat. And `LED Night Brightness 0` reuses the existing
   brightness-0 master-off, arriving at dusk and leaving at dawn.
+- **Night can never exceed day.** Both numbers run `clamp_night_to_day` on
+  change, which is one rule covering both directions: raising night past day
+  pulls it back, lowering day below night drags night down with it. Enforced on
+  the device rather than only in the dashboard, because the device's own web UI
+  and a raw MQTT publish can set these too — an invariant only one publisher
+  respects is not one.
 
 That "equal setpoints is off" property is also why the update seeds night from
 day on first boot rather than shipping a fixed default. A new entity has nothing
@@ -451,6 +457,81 @@ the effective brightness moves a whole percent, so a device outside twilight is
 completely silent on the broker. Each `/state` snapshot carries
 `led_brightness_effective_pct` and `sun_elevation_deg` (the latter omitted while
 the clock is invalid) so the ramp is observable without adding entities.
+
+### Ambience effects
+
+Two decorative modulations of the steady colour, for when the indicator is
+also a thing in a room:
+
+| Entity | Values | Default |
+|---|---|---|
+| `LED Ambience` | `Off`, `Breathing`, `Steampunk` | `Off` |
+| `LED Ambience Intensity` | 0–100 % | 40 |
+
+- **Breathing** — resting respiration, ~11–14 breaths/min. Every cycle redraws
+  its own period, amplitude and inhale/hold/exhale/pause split, so no two are
+  alike; every few minutes it takes a deeper, slower sigh. Inhale and exhale are
+  raised cosines, which puts a zero derivative at every join and makes the whole
+  cycle corner-free. The asymmetry is the point: inhale is an active effort and
+  quick, exhale is passive and slower, and there is a real pause at the bottom.
+  A symmetric wave reads as a machine.
+- **Steampunk** — a firebox seen through a viewport. Three sines whose periods
+  share no common multiple, so the sum is quasi-periodic and never repeats, plus
+  a slow random walk eased with raised cosines, plus an occasional swell as
+  something vents. Deliberately *not* ESPHome's `flicker`, which is per-frame
+  noise — noise reads as a loose connection, this should read as something large
+  and hot changing its mind slowly.
+
+`LED Ambience Intensity` scales the modulation depth against the
+`ambience_depth_max` substitution (0.35), so 100 % swings the brightness across
+about a third of its level and the judgement about how far is too far lives in
+one place. 0 leaves the effect selected but flat; the select is the off switch.
+
+These change only how bright the band colour is, moment to moment. Never which
+colour, never the band, never the publish cadence. And they stand down whenever
+the light has something to say:
+
+| Situation | Ambience |
+|---|---|
+| Band 0–1 (green, yellow) | Runs |
+| Band ≥ `ambience_max_band` + 1 (orange and up) | Off — steady colour |
+| Air danger strobe active | Off — the alarm owns the light |
+| Boot self-test / button status flash | Off, restored afterwards |
+| LED dark (brightness 0, source `Off`) | Nothing to modulate |
+
+A warning that is also gently pulsing reads as less urgent than one that is not.
+Set `ambience_max_band` to 5 if you would rather have the effect at every band.
+
+**How they compose with everything else**, which is why they are `light:`
+effects and not a script driving `light.turn_on` in a loop:
+
+- An `addressable_lambda` writes the LED buffer directly in the component loop.
+  It issues no `LightCall`, so it adds **no MQTT traffic at all** — the script
+  version would publish the light's state on every frame, forever.
+- `current_color` arrives as the band hue with the master brightness *not*
+  applied; brightness reaches the LEDs through the colour correction. Scaling
+  that colour therefore does exactly what moving the brightness slider would,
+  and the day/night ramp, the band-5 dimming and the attention pulse all keep
+  working underneath without either effect knowing they exist.
+- Correction order is scale-by-brightness *then* gamma, so the modulation needs
+  no gamma compensation of its own to look linear.
+
+Two limits worth knowing:
+
+- **An effect can only scale down.** The hue arrives with its brightest channel
+  already at 255. For the swing to sit *around* the setpoint rather than only
+  below it, `update_air_quality_led` raises the level by half the depth and lets
+  the effect take the difference back. At or near 100 % brightness there is no
+  headroom to raise into, so the swing quietly becomes downward-only.
+- **Low brightness bands.** At a night level of a few percent the correction
+  leaves only a handful of pre-gamma steps and gamma compresses them further, so
+  both effects will step visibly. That is an 8-bit output limit; they are at
+  their best at moderate brightness.
+
+With an effect running, a band change fades its *brightness* but snaps its
+*hue*: `AddressableLightTransformer` lerps the colour values rather than the
+per-LED buffer while an effect owns it, and effects read the target colour
+immediately. Still smooth, just different from the 1 s crossfade below.
 
 ### Fade and pulse
 
