@@ -102,9 +102,18 @@ with its default `esphome/apollo-air-1`.
     "wifi_rssi_db": -58,
     "esp_temperature_c": 34.2,
     "uptime_s": 23,
+    "led_brightness_effective_pct": 37,
+    "sun_elevation_deg": -2.4,
     "firmware_version": "1.0.0-mqtt"
   }
   ```
+
+  `led_brightness_effective_pct` is where the [day/night
+  ramp](#daynight-dimming) currently sits — the steady brightness being asked
+  for, before band-5 dimming and before any momentary strobe or pulse (`-1`
+  until first computed). `sun_elevation_deg` is **omitted entirely** while the
+  device's clock has not synced, rather than sent as `0`, which is a real
+  elevation and would read as dusk.
 
   `air_band` is the 0–5 worst-of severity band the device graded this reading
   at (`-1` if nothing was readable) — the same number that picks the LED colour,
@@ -230,12 +239,19 @@ behaviour).
 ## Air quality LED
 
 The steady RGB colour, ported from upstream `Core.yaml` and then extended with a
-combined `All` mode. Two config entities drive it:
+combined `All` mode. Three config entities drive it:
 
 | Entity | Values | Default |
 |---|---|---|
 | `Air Quality LED Source` | `Off`, `All`, `PM AQI`, `CO2`, `VOC Index`, `NOx Index` | `All` |
 | `LED Brightness` | 0–100 % (0 = off) | 100 |
+| `LED Night Brightness` | 0–100 % (0 = off) | 100 |
+
+`LED Brightness` is the **daytime** level despite its bare name — see
+[Day/night dimming](#daynight-dimming) for why it was not renamed. On the first
+boot after updating, `LED Night Brightness` is seeded from whatever
+`LED Brightness` was, so the two start equal and the device behaves exactly as
+it did before day/night dimming existed until you choose a night level.
 
 `All` is the local addition and the default: it colours the LED by the **worst**
 band across every air-quality channel at once, so a spike on any one of them is
@@ -375,6 +391,67 @@ it tracks a change at about the rate a person notices one. Repaints that would
 not change anything are skipped, which keeps the light's own MQTT state topic
 quiet on an idle device.
 
+### Day/night dimming
+
+The steady colour runs at `LED Brightness` while the sun is up and at
+`LED Night Brightness` once it is down, easing between the two across twilight.
+A bedroom indicator that is readable across the room at noon is a nightlight at
+2 a.m., and the interesting case — "dark all night, but still strobe if the CO2
+hits 5000" — is one slider away.
+
+Driven by the sun's **elevation**, not a clock offset:
+
+| Elevation | Steady brightness |
+|---|---|
+| ≥ `sun_fade_high_deg` (+3°) | `LED Brightness` |
+| between | linear interpolation |
+| ≤ `sun_fade_low_deg` (−6°, civil dusk) | `LED Night Brightness` |
+
+Elevation is self-adjusting — the same two numbers give a longer ramp in
+December than in June, as the sky does — and needs no timezone, since elevation
+is a function of UTC and the coordinates. There is deliberately no `timezone:`
+in the config as a result. At 42.6° N the ramp runs roughly 35–50 min.
+
+This costs the firmware a clock. `time:` (SNTP) and `sun:` are the only
+components here that talk to anything other than the broker; point
+`ntp_server` at a LAN time server if outbound NTP is filtered on your VLAN.
+**Every failure mode holds the daytime brightness** — before the first sync, on
+a device that can never reach NTP, and for the first seconds after boot. Failing
+bright is the safe direction: an LED dark at noon looks like a dead device,
+while an LED bright at midnight is just the old behaviour.
+
+Coordinates come from the retained `${mqtt_topic}/config/home` message the
+dashboard app publishes (the same one Node-RED reads for its outdoor polling),
+falling back to the `home_latitude` / `home_longitude` substitutions until it
+arrives. Location is configured once, in the app, and every consumer follows.
+
+Two things to know:
+
+- **`LED Brightness` was not renamed to `LED Brightness Day`.** ESPHome derives
+  both the MQTT object_id *and* the flash preference key from an entity's name,
+  so renaming it would have silently moved its topic — the same trap documented
+  on `Air Quality LED Source` — and orphaned its stored value, resetting a unit
+  dimmed to 30 % back to 100 % on the very OTA that adds dimming. It keeps its
+  name and quietly becomes the daytime value.
+- **There is no enable switch**, for the same reason there is no separate LED
+  on/off switch. Equal setpoints *is* off: the interpolation between two equal
+  endpoints is flat. And `LED Night Brightness 0` reuses the existing
+  brightness-0 master-off, arriving at dusk and leaving at dawn.
+
+That "equal setpoints is off" property is also why the update seeds night from
+day on first boot rather than shipping a fixed default. A new entity has nothing
+in flash to restore, so a static `initial_value: 100` would come up at 100 on a
+unit that had been dimmed to 41 % — making the LED *brighter* at night on the
+update that adds night dimming. A one-shot migration in `on_boot` (guarded by
+the restored `daynight_migrated` flag) copies day → night exactly once per
+device instead.
+
+The ramp is recomputed every `sun_dim_interval` (30 s) but only repaints when
+the effective brightness moves a whole percent, so a device outside twilight is
+completely silent on the broker. Each `/state` snapshot carries
+`led_brightness_effective_pct` and `sun_elevation_deg` (the latter omitted while
+the clock is invalid) so the ramp is observable without adding entities.
+
 ### Fade and pulse
 
 Band changes are not instant swaps:
@@ -421,6 +498,11 @@ The two controls are independent, and compose into everything worth having:
 only what the LED does the rest of the time. Nothing suppresses anything — the
 strobe outranks the steady color through the `air_danger_active` guard, so the
 color painter never needs to know the mode.
+
+Read `LED Brightness` in that table as *the effective brightness right now* —
+the day/night interpolation, not the daytime slider on its own. Row one is
+therefore also what `LED Night Brightness 0` gives you every night, without
+touching the daytime setting.
 
 Row one is the quiet setup the alarm was designed around: a dark LED makes the
 strobe unmissable and makes *dark itself* mean "nothing is wrong". Row two

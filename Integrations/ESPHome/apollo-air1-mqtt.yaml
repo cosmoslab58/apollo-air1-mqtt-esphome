@@ -55,6 +55,14 @@
 #     "All" option (the new default), which colours the LED by the WORST band
 #     across PM AQI, CO2, VOC and NOx instead of one chosen metric. The
 #     LED repaints on every sensor reading rather than once per publish.
+#   - Day/night LED dimming: a second brightness setpoint, "LED Night
+#     Brightness", takes over once the sun is down, easing between the two
+#     across twilight rather than switching. Needs a clock, so this fork also
+#     adds `time:` (SNTP) and `sun:` — the only outbound connection this
+#     firmware makes besides the broker. The device does the ramp itself: a
+#     dimming schedule pushed from outside would have to overwrite the
+#     brightness setpoint to apply, which is the one place the user's own
+#     preference is stored. See the day/night substitutions below.
 #   - MQTT-triggered pull OTA: publish a firmware URL to `${mqtt_topic}/command/ota`
 #     and the device downloads + installs it itself. Push OTA (`esphome run`)
 #     needs the device's address, which is `apollo-air-1-<mac>.local` thanks to
@@ -69,7 +77,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.1.16-mqtt"
+  version: "1.2.1-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -174,6 +182,49 @@ substitutions:
   danger_aqi: "200"
   danger_voc_index: "0"
 
+  # --- Day/night LED dimming -------------------------------------------------
+  # The steady LED runs at "LED Brightness" while the sun is up and at "LED
+  # Night Brightness" once it is down, easing between the two across twilight.
+  # See the sun_dim_evaluate script for the mechanism.
+  #
+  # The ramp is driven by the sun's ELEVATION rather than by a clock offset
+  # ("30 min before sunset"), because elevation is self-adjusting: the same two
+  # numbers give a longer twilight in December than in June, exactly as the sky
+  # does, and the maths needs no timezone at all (elevation is computed in UTC,
+  # which is why there is no timezone: key on the time component below).
+  #
+  #   sun_fade_high_deg  at or above this elevation it is fully DAY
+  #   sun_fade_low_deg   at or below this elevation it is fully NIGHT
+  #
+  # -6 is civil dusk -- the conventional "it is now dark" mark, when the horizon
+  # is no longer distinguishable. +3 rather than 0 because the last few degrees
+  # above the horizon are already dim enough indoors to want the night level.
+  # At 42.6N that spans roughly 35-50 min depending on season.
+  #
+  # Widen the pair for a longer, gentler ramp; set them equal-ish for an abrupt
+  # switch at that elevation. Reversed or equal values would divide by zero, so
+  # sun_dim_evaluate falls back to a hard cut if high <= low.
+  sun_fade_high_deg: "3.0"
+  sun_fade_low_deg: "-6.0"
+
+  # Fallback location for the sun calculation, used ONLY until the dashboard's
+  # retained home-config message arrives (see the config/home subscription in
+  # the mqtt block). Matches home_config.py's default home in the dashboard app,
+  # so an un-configured pair of components still agree with each other.
+  home_latitude: "42.5988"
+  home_longitude: "-83.3577"
+
+  # How often the day/night ramp is recomputed. Not the sensor cadence and not a
+  # publish rate: it only re-derives one float and repaints the LED if the
+  # effective brightness moved by a whole percent. Across a ~40 min twilight
+  # that is at most ~90 repaints, and outside twilight it is silent.
+  sun_dim_interval: "30s"
+
+  # Where the clock comes from. Any NTP host: a LAN router or local time server
+  # is preferable if outbound UDP/123 is filtered on this VLAN. pool.ntp.org is
+  # kept as the second entry either way, so a dead LAN server still resolves.
+  ntp_server: "pool.ntp.org"
+
 esphome:
   name: "${name}"
   friendly_name: "${friendly_name}"
@@ -191,6 +242,23 @@ esphome:
           state: "${version}"
       - lambda: |-
           id(deep_sleep_1).set_sleep_duration(id(deep_sleep_sleep_duration).state * 60 * 1000);
+      # Day/night migration, once per device. See the daynight_migrated global
+      # for why a static initial_value could not do this job. Safe at priority
+      # 500: restored number states are already available here, which is what
+      # the sleep-duration line above depends on too.
+      - if:
+          condition:
+            lambda: "return !id(daynight_migrated);"
+          then:
+            - lambda: |-
+                id(daynight_migrated) = true;
+                const float day = id(air_quality_led_brightness).state;
+                if (isnan(day)) {
+                  ESP_LOGW("led", "day/night migration: no day brightness to copy, leaving night at its default");
+                  return;
+                }
+                ESP_LOGI("led", "day/night migration: seeding night brightness from day (%.0f%%)", day);
+                id(air_quality_led_night_brightness).make_call().set_value(day).perform();
       - if:
           condition:
             switch.is_on: prevent_sleep
@@ -236,6 +304,37 @@ wifi:
     ssid: "Apollo AIR1 Hotspot"
 
 captive_portal:
+
+# Clock and sun position. Both exist for exactly one feature -- the day/night
+# LED ramp -- and nothing else in this config reads the time.
+#
+# No `timezone:` on purpose. Sun elevation is a function of UTC and the
+# coordinates, so the ramp is correct with no timezone set at all, and one more
+# piece of per-site config that could be wrong is one fewer thing to be wrong.
+# (Set it if you later want local wall-clock times in the logs.)
+#
+# If NTP never syncs, the sun component still answers -- with garbage computed
+# from the 1970 epoch. sun_dim_evaluate therefore checks the clock is valid
+# before it dims, and holds the daytime brightness if it is not: a wrong clock
+# should never be able to leave the indicator dark. Confirm a real sync after
+# flashing with `just logs` (the sntp component logs "Synchronized time").
+time:
+  - platform: sntp
+    id: sntp_time
+    servers:
+      - ${ntp_server}
+      - pool.ntp.org
+      - time.nist.gov
+
+# Coordinates are the compile-time fallback only; the retained config/home
+# message from the dashboard overrides them at runtime (see the mqtt block), so
+# the home location lives in one place -- the dashboard -- rather than being
+# baked into each consumer separately.
+sun:
+  id: air1_sun
+  time_id: sntp_time
+  latitude: ${home_latitude}°
+  longitude: ${home_longitude}°
 
 web_server:
   port: 80
@@ -287,6 +386,37 @@ mqtt:
               - ota.http_request.flash:
                   url: !lambda 'return std::string(x["url"] | "");'
                   md5_url: !lambda 'return std::string(x["url"] | "") + ".md5";'
+    # Home location, for the sun calculation behind the day/night LED ramp.
+    # Published RETAINED by the dashboard app (home_config.py) as
+    #   {"zip":..., "lat":..., "lon":..., "location_slug":..., "purpleair_sensor":...}
+    # and consumed by Node-RED too, so the location is configured once, in the
+    # app, and every consumer follows. Retained means this lands within a second
+    # of connecting rather than waiting for the next time someone saves a home.
+    #
+    # Unlike the OTA topic above, retention is exactly what this wants: replaying
+    # it on every reconnect is idempotent (it sets two doubles).
+    #
+    # Only the fields this device needs are read; the rest are Node-RED's. A
+    # missing or nonsensical payload leaves the compile-time fallback in place --
+    # 0,0 is in the Gulf of Guinea, so it must be rejected rather than trusted.
+    - topic: ${mqtt_topic}/config/home
+      qos: 1
+      then:
+        - lambda: |-
+            const double lat = x["lat"] | 1000.0;
+            const double lon = x["lon"] | 1000.0;
+            if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 ||
+                (lat == 0.0 && lon == 0.0)) {
+              ESP_LOGW("sun", "config/home has no usable lat/lon - keeping ${home_latitude}, ${home_longitude}");
+              return;
+            }
+            id(air1_sun).set_latitude(lat);
+            id(air1_sun).set_longitude(lon);
+            ESP_LOGI("sun", "home location set to %.4f, %.4f", lat, lon);
+        # Re-derive the ramp against the new coordinates rather than waiting up
+        # to ${sun_dim_interval} for the next tick. Cheap and idempotent, so it
+        # runs even when the payload was rejected above.
+        - script.execute: sun_dim_evaluate
   on_connect:
     - delay: 20s
     # Retained, so this only has to succeed once per connect to keep every
@@ -351,6 +481,51 @@ globals:
     restore_value: no
     type: float
     initial_value: "-1.0f"
+
+  # The day/night ramp, 0.0 = fully night ... 1.0 = fully day. Recomputed from
+  # the sun's elevation every ${sun_dim_interval} by sun_dim_evaluate, and read
+  # by update_air_quality_led to interpolate between the two brightness
+  # setpoints. Deliberately NOT restored: it is a pure function of the clock and
+  # the coordinates, so it must be re-derived on boot, never replayed from
+  # flash -- a device that rebooted at dusk and restored a stale 1.0 would sit
+  # at daytime brightness until the next tick.
+  #
+  # Starts at 1.0 (day). Every fallback in this feature is "hold the daytime
+  # brightness": before the first NTP sync, on a device that cannot reach NTP at
+  # all, and in the first seconds after boot. Failing bright is the safe
+  # direction -- failing dark would look exactly like a broken indicator.
+  - id: sun_day_factor
+    restore_value: no
+    type: float
+    initial_value: "1.0f"
+
+  # Last effective brightness percent actually handed to update_air_quality_led,
+  # quantised to whole percent. The ramp is recomputed far more often than it
+  # meaningfully moves, and every repaint is an MQTT light-state publish, so
+  # this is what keeps a device outside twilight completely silent. -1 = unknown.
+  - id: led_dim_last_pct
+    restore_value: no
+    type: int
+    initial_value: "-1"
+
+  # One-shot marker for the day/night migration in on_boot. Restored, so it
+  # survives reboots and the migration runs exactly once per device, ever.
+  #
+  # Why it exists: "LED Night Brightness" ships with initial_value 100, and a
+  # new entity has nothing in flash to restore, so the FIRST boot after the OTA
+  # that introduced it comes up at 100 regardless of what the device was
+  # actually set to. On a unit dimmed to 41% that is not the no-op it looks
+  # like -- it is the LED getting BRIGHTER at night, which is precisely
+  # backwards for the feature being added. (Observed on exactly that unit.)
+  #
+  # So the honest default for night is not a constant at all: it is whatever
+  # day is, which makes the interpolation flat and the OTA genuinely invisible
+  # until someone chooses a night level. That cannot be expressed as a static
+  # initial_value, hence this.
+  - id: daynight_migrated
+    restore_value: yes
+    type: bool
+    initial_value: "false"
 
   # ===========================================================================
   # THE BAND TABLES. This is the single source of truth for "how bad is it" on
@@ -559,6 +734,15 @@ interval:
           id(publish_last_band) = band;
           id(reportAllValues).execute();
 
+  # Day/night LED ramp. Unconditional -- unlike the publish tick above it is not
+  # gated on prevent_sleep, because the LED is lit on a duty-cycled device too
+  # (for the ~2 min of each wake it is awake) and should be dimmed then as well.
+  # Cheap enough to run flat out: see sun_dim_evaluate for why this ticks far
+  # faster than it acts.
+  - interval: ${sun_dim_interval}
+    then:
+      - script.execute: sun_dim_evaluate
+
 # Stock air-quality LED. Upstream Core.yaml drives rgb_light from ONE selected
 # metric, banded into six severity colors. "All" is a local addition and the
 # default: it takes the worst band across every air-quality channel the device
@@ -622,6 +806,47 @@ number:
     on_value:
       then:
         - script.execute: apply_led_state
+
+  # Night half of the pair above. The two are interpolated by the sun's
+  # elevation across twilight (see sun_dim_evaluate), so this is what the steady
+  # colour settles to once it is properly dark, and "LED Brightness" is what it
+  # settles to in daylight.
+  #
+  # NAMING. "LED Brightness" was not renamed to "LED Brightness Day" when this
+  # was added, and the asymmetry is deliberate. ESPHome derives both the MQTT
+  # object_id AND the flash preference key from the entity NAME, so renaming it
+  # would have changed its topic (breaking every publisher, silently -- see the
+  # warning on the select above) and orphaned its stored value, resetting a unit
+  # that had been dimmed to 30% back to 100% on the OTA that introduced a
+  # feature about dimming. It keeps its name and quietly becomes the daytime
+  # value; the dashboard labels the pair "Day" and "Night".
+  #
+  # initial_value 100 only makes this a no-op on a device that was already at
+  # 100. On any other, a new entity with nothing in flash to restore would come
+  # up at 100 and make the LED BRIGHTER at night than it was before the update.
+  # The real default for night is "whatever day is", which is not a constant --
+  # the one-shot migration in on_boot seeds it, so the OTA is invisible until
+  # someone chooses a night level. See the daynight_migrated global.
+  #
+  # There is no separate enable switch for the same reason there is no separate
+  # LED on/off switch -- night == day IS off, and 0 is a genuinely dark night.
+  - platform: template
+    name: "LED Night Brightness"
+    id: air_quality_led_night_brightness
+    icon: mdi:brightness-3
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 100
+    mode: slider
+    on_value:
+      then:
+        - script.execute: apply_led_state
+
   - platform: template
     name: "SEN55 Temperature Offset"
     id: sen55_temperature_offset
@@ -1375,7 +1600,27 @@ script:
           // plus a brightness -- and applies it exactly once at the bottom,
           // through the dedup guard. Nothing here may touch rgb_light directly.
           int band = -1;
-          float level = id(air_quality_led_brightness).state / 100.0f;
+
+          // The steady brightness is the day/night interpolation, not the raw
+          // slider. sun_day_factor is 1.0 in daylight, 0.0 once it is properly
+          // dark, and eases between the two across twilight -- see
+          // sun_dim_evaluate, which is the only writer. Both endpoints are read
+          // fresh here rather than cached, so moving either slider takes effect
+          // on the next repaint at whatever point in the ramp we are at.
+          //
+          // Equal endpoints (the shipped default) collapse this to the previous
+          // behaviour exactly: the factor cancels out and level is the slider.
+          float day_pct = id(air_quality_led_brightness).state;
+          float night_pct = id(air_quality_led_night_brightness).state;
+          // A template number reads NaN until its restored/initial value has
+          // been published -- only reachable in the first moments of boot, but
+          // NaN survives every comparison below (the <= 0 master-off included)
+          // and would reach set_brightness intact, painting an undefined
+          // brightness. Pin each endpoint to the other, or to full.
+          if (isnan(day_pct)) day_pct = isnan(night_pct) ? 100.0f : night_pct;
+          if (isnan(night_pct)) night_pct = day_pct;
+
+          float level = (night_pct + (day_pct - night_pct) * id(sun_day_factor)) / 100.0f;
 
           const std::string src = id(air_quality_led_source).current_option();
 
@@ -1394,6 +1639,11 @@ script:
           // compose -- brightness 0 is "dark between alarms", any other value
           // is "show me the band between alarms", and the alarm behaves the
           // same either way.
+          //
+          // The test is on the EFFECTIVE level, so a night brightness of 0 is
+          // simply this same master-off arriving at dusk and leaving at dawn:
+          // an LED that is dark overnight and still strobes for an emergency
+          // needs no new control, just a 0 in the night slider.
           if (level <= 0.0f || src == "Off") {
             band = -1;
           } else if (src == "All") {
@@ -1479,6 +1729,78 @@ script:
             // no longer means what the pulse was announcing.
             id(led_pulse).stop();
           }
+
+  # Day/night ramp. The ONLY writer of sun_day_factor: it maps the sun's
+  # elevation onto 0.0 (night) .. 1.0 (day) and hands the repaint to
+  # update_air_quality_led, which owns every actual LightCall. Nothing here
+  # touches rgb_light, so the ramp cannot fight the band painter, the danger
+  # strobe or the attention pulse -- it changes one number and asks for a
+  # repaint, and all the existing precedence rules still apply on top.
+  #
+  # Elevation, not a clock offset. ${sun_fade_high_deg} and above is full day,
+  # ${sun_fade_low_deg} and below is full night, linear in between -- so the
+  # ramp lengthens in winter and shortens in summer on its own, and no timezone
+  # is involved. See the substitutions for why those two numbers.
+  #
+  # Runs every ${sun_dim_interval}, which is far more often than the result
+  # meaningfully moves. The quantise-to-whole-percent gate at the bottom is what
+  # makes that cheap: across a ~40 min twilight the effective brightness passes
+  # through at most ~90 distinct percents (fewer, when the two setpoints are
+  # closer together), and outside twilight it produces no calls at all. Without
+  # the gate this would repaint -- and publish an MQTT light state -- twice a
+  # minute forever.
+  #
+  # mode: single, and there are no delays here, so it can never overlap itself.
+  - id: sun_dim_evaluate
+    mode: single
+    then:
+      - lambda: |-
+          // Before the light exists, same guard as update_air_quality_led. The
+          // first interval tick can land during setup.
+          if (millis() < 5000) {
+            return;
+          }
+
+          // A clock we do not trust means no dimming at all. sun.elevation()
+          // will happily answer from a 1970 epoch, and the answer would be
+          // wrong by hours -- an LED dark at noon looks like a dead device,
+          // while an LED bright at midnight is merely the behaviour everyone
+          // had before this feature. So every failure here holds DAY.
+          float f = 1.0f;
+          if (id(sntp_time).now().is_valid()) {
+            const double elev = id(air1_sun).elevation();
+            const float hi = ${sun_fade_high_deg};
+            const float lo = ${sun_fade_low_deg};
+            if (hi <= lo) {
+              // Misconfigured (or deliberately equal) window: degrade to a hard
+              // cut at the threshold rather than dividing by zero.
+              f = (elev >= hi) ? 1.0f : 0.0f;
+            } else {
+              f = (float) ((elev - lo) / (hi - lo));
+              if (f < 0.0f) f = 0.0f;
+              if (f > 1.0f) f = 1.0f;
+            }
+          }
+          id(sun_day_factor) = f;
+
+          // Mirror update_air_quality_led's endpoint handling so the gate is
+          // computed on the same numbers the painter will use. This is only the
+          // gate -- the painter re-derives the real level itself.
+          float day_pct = id(air_quality_led_brightness).state;
+          float night_pct = id(air_quality_led_night_brightness).state;
+          if (isnan(day_pct)) day_pct = isnan(night_pct) ? 100.0f : night_pct;
+          if (isnan(night_pct)) night_pct = day_pct;
+
+          const int pct = (int) roundf(night_pct + (day_pct - night_pct) * f);
+          if (pct == id(led_dim_last_pct)) {
+            return;
+          }
+          id(led_dim_last_pct) = pct;
+
+          ESP_LOGD("sun", "elevation %.2f deg -> day factor %.3f, steady LED %d%%",
+                   id(sntp_time).now().is_valid() ? id(air1_sun).elevation() : 0.0,
+                   f, pct);
+          id(update_air_quality_led).execute();
 
   # Attention swell for a worsening band change, fired by update_air_quality_led
   # once it has painted the new colour. One smooth rise to full brightness and
@@ -1647,6 +1969,24 @@ script:
             root["wifi_rssi_db"] = id(wifi_signal_db).state;
             root["esp_temperature_c"] = id(sys_esp_temperature).state;
             root["uptime_s"] = id(sys_uptime).state;
+            // Day/night ramp readback. Both ride the existing combined snapshot
+            // rather than becoming their own entities, so watching the ramp
+            // costs no extra MQTT traffic at all.
+            //
+            // led_brightness_effective_pct is the STEADY brightness the ramp is
+            // currently asking for -- the interpolation between the two
+            // setpoints, before the band-5 dimming and before any alarm strobe
+            // or attention pulse, which are momentary and override it. -1 while
+            // it has not been computed yet (first seconds after boot).
+            //
+            // sun_elevation_deg is OMITTED rather than sent as 0 while the
+            // clock is invalid -- 0 is a real elevation (the horizon) and would
+            // read as dusk. Absent is the same convention the MICS-4514 fields
+            // use, and consumers already drop keys they did not get.
+            root["led_brightness_effective_pct"] = id(led_dim_last_pct);
+            if (id(sntp_time).now().is_valid()) {
+              root["sun_elevation_deg"] = id(air1_sun).elevation();
+            }
             root["firmware_version"] = "${version}";
       # Re-evaluate the air-danger alarm against the readings just published,
       # so the LED and the snapshot can never disagree about the same cycle.
