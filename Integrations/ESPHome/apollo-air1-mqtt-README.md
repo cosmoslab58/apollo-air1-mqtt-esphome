@@ -244,14 +244,18 @@ combined `All` mode. Three config entities drive it:
 | Entity | Values | Default |
 |---|---|---|
 | `Air Quality LED Source` | `Off`, `All`, `PM AQI`, `CO2`, `VOC Index`, `NOx Index` | `All` |
-| `LED Brightness` | 0–100 % (0 = off) | 100 |
-| `LED Night Brightness` | 0–100 % (0 = off) | 100 |
+| `LED Brightness` | 0–100 % (0 = off) | 33 |
+| `LED Night Brightness` | 0–100 % (0 = off) | 21 |
 
 `LED Brightness` is the **daytime** level despite its bare name — see
-[Day/night dimming](#daynight-dimming) for why it was not renamed. On the first
-boot after updating, `LED Night Brightness` is seeded from whatever
-`LED Brightness` was, so the two start equal and the device behaves exactly as
-it did before day/night dimming existed until you choose a night level.
+[Day/night dimming](#daynight-dimming) for why it was not renamed.
+
+The two defaults are measured rather than round: 33 % is where the indicator is
+readable across a room without being a presence in it, and 21 % is dim enough
+for a bedroom while still leaving the [ambience effects](#ambience-effects)
+enough PWM steps to work with. Below about 20 % they run out of resolution.
+Night defaults *below* day deliberately — see
+[Day/night dimming](#daynight-dimming).
 
 `All` is the local addition and the default: it colours the LED by the **worst**
 band across every air-quality channel at once, so a spike on any one of them is
@@ -444,13 +448,15 @@ Two things to know:
   and a raw MQTT publish can set these too — an invariant only one publisher
   respects is not one.
 
-That "equal setpoints is off" property is also why the update seeds night from
-day on first boot rather than shipping a fixed default. A new entity has nothing
-in flash to restore, so a static `initial_value: 100` would come up at 100 on a
-unit that had been dimmed to 41 % — making the LED *brighter* at night on the
-update that adds night dimming. A one-shot migration in `on_boot` (guarded by
-the restored `daynight_migrated` flag) copies day → night exactly once per
-device instead.
+**The night default sits below the day default on purpose.** An earlier version
+shipped 100 % here, which on a unit already dimmed to 41 % would have made the
+LED *brighter* at night on the very update that added night dimming — a new
+entity has nothing in flash to restore, so it comes up at its `initial_value`
+regardless of what the device was set to. That was patched at the time with a
+one-shot `on_boot` migration seeding night from day; the migration has since
+been removed, because a default *under* the day default cannot brighten anything
+by construction, and the clamp above covers the case where someone's day sits
+lower still. Simpler, and one less piece of state in flash.
 
 The ramp is recomputed every `sun_dim_interval` (30 s) but only repaints when
 the effective brightness moves a whole percent, so a device outside twilight is
@@ -465,8 +471,8 @@ also a thing in a room:
 
 | Entity | Values | Default |
 |---|---|---|
-| `LED Ambience` | `Off`, `Breathing`, `Steampunk` | `Off` |
-| `LED Ambience Intensity` | 0–100 % | 40 |
+| `LED Ambience` | `Off`, `Breathing`, `Steampunk` | `Breathing` |
+| `LED Ambience Intensity` | 0–100 % | 47 |
 
 - **Breathing** — a sleeping adult, ~7–9 breaths/min (`breath_period_*_ms`).
   Deliberately slower than real sleeping respiration, which runs 10–16: a light

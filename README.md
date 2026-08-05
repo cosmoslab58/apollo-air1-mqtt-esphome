@@ -8,7 +8,7 @@
 > any other MQTT consumer directly. See
 > **[the MQTT firmware README](Integrations/ESPHome/apollo-air1-mqtt-README.md)**.
 >
-> Two pieces may be useful even if you don't own an AIR-1:
+> Four pieces may be useful even if you don't own an AIR-1:
 >
 > - **One combined JSON snapshot per cycle** on `<topic>/state`, instead of
 >   rejoining ~20 per-entity topics to reconstruct a single reading.
@@ -16,6 +16,17 @@
 >   and installs it itself, so updates never need the device's IP or hostname.
 >   Handy for units behind a VLAN or anywhere mDNS doesn't reach. The pattern is
 >   generic ESPHome, not AIR-1-specific.
+> - **Day/night LED dimming driven by sun elevation**, with `time:` + `sun:` on
+>   the device so the ramp needs no timezone and no network schedule — the
+>   device works out where the sun is and eases between two brightness
+>   setpoints across twilight.
+> - **Sub-LSB brightness dithering** for the ambience effects
+>   ([`ambience_dither.h`](Integrations/ESPHome/ambience_dither.h)). A
+>   comfortable indoor brightness is a very small PWM number — 11/255 here — so
+>   a smooth fade has almost no levels to move through. Dithering spatially
+>   across the LEDs and temporally across frames synthesises the missing ones.
+>   It measures where the output steps are rather than assuming a gamma curve,
+>   which makes it portable to any addressable ESPHome light.
 >
 > Everything else below is upstream's documentation, unchanged.
 
