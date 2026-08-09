@@ -28,6 +28,11 @@
 >   It measures where the output steps are rather than assuming a gamma curve,
 >   which makes it portable to any addressable ESPHome light.
 >
+> **Setting up a unit:** [`docs/PROVISIONING.md`](docs/PROVISIONING.md) covers
+> the server side — broker account and ACL, registering a tenant, and
+> verification. The device itself is documented in
+> [the MQTT firmware README](Integrations/ESPHome/apollo-air1-mqtt-README.md).
+>
 > Everything else below is upstream's documentation, unchanged.
 
 ---
