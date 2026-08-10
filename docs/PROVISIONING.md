@@ -18,52 +18,79 @@ authoritative statement; the chassis-shield repo's `docs/PROVISIONING.md` points
 here rather than restating it.
 
 ```
-<account>/<device-path>/<channel...>
+cosmoslab/<category>/<account>/<vendor>/<model>/<device>/<channel...>
+   seg0      seg1       seg2      seg3     seg4     seg5     seg6+
 ```
 
-- **Segment 0 is the account.** It is the ACL root, the isolation boundary, and
-  the value of the `tenant` tag in InfluxDB. `walnut` is a household account;
-  `cosmoslab` is the lab's own account. Same category of thing — an *owner* —
-  even though one is a place and one is an organization.
-- **The device path is one or more segments, and its LAST segment is the device
-  id.** For a sensor that measures a whole room, the convention is to use the
-  room (`living_room`). For a product family it may carry a grouping segment
-  first (`aeroguard/J-ROC`).
-- **Everything after the device path is the channel** — `state`, `status`,
-  `telemetry`, `config/home`, `sensor/co2/state`.
+**Exactly six segments before the channel. That is a rule, not a habit** — three
+separate properties below depend on the positions being fixed.
 
-Live examples, both trees:
+| Seg | Role | Today | Notes |
+|---|---|---|---|
+| 0 | operator | `cosmoslab` | Constant. Reserves the root so another operator's tree could coexist. |
+| 1 | category | `smarthome`, `industrial` | Broad product line. |
+| 2 | **account** | `walnut`, `founding-eng` | The **owner**: the ACL root, the isolation boundary, and the `tenant` tag in InfluxDB. |
+| 3 | vendor | `apollo`, `shelly`, `chassisshield` | Who makes it. |
+| 4 | model | `air1`, `mini1pmg4`, `aeroguard` | The product. Lowercase slug. |
+| 5 | **device** | `living_room`, `basement_bath_fan`, `J-ROC` | Stable local name; the `device_id` tag. |
+| 6+ | channel | `state`, `telemetry`, `config/home`, `sensor/co2/state` | One or more segments. |
+
+Live examples, all three trees:
 
 ```
-walnut/living_room/state                     home sensor, device path depth 1
-walnut/basement_bath_fan/status/switch:0     home actuator, device path depth 1
-cosmoslab/aeroguard/J-ROC/telemetry          product family, device path depth 2
+cosmoslab/smarthome/walnut/apollo/air1/living_room/state
+cosmoslab/smarthome/walnut/shelly/mini1pmg4/basement_bath_fan/status/switch:0
+cosmoslab/industrial/founding-eng/chassisshield/aeroguard/J-ROC/telemetry
 ```
 
-Node-RED derives identity from the topic and is depth-agnostic:
-`tenantId = parts[0]`, `deviceId = parts[parts.length - 2]`.
+Because the positions are fixed, every consumer derives identity by **absolute
+left index** — `account = parts[2]`, `device = parts[5]` — which is correct for
+*every* channel shape. Right-indexing (`parts[length - 2]`) is what the old
+scheme needed, and it breaks on a two-segment channel like `config/home`.
 
-Three things this rule deliberately does **not** say:
+### Why the account sits above the vendor
 
-- **The device id is a device slug, not necessarily a room.**
-  `walnut/basement_bath_fan` is a fixture, because a basement bathroom can hold
-  both a fan and a sensor. Room-as-identity is the convention for whole-room
-  sensors only.
-- **The model name never appears in the topic.** `walnut/air1/living_room` was
+So that isolation is a **pure prefix**, the strongest form an MQTT ACL can take:
+
+```
+topic readwrite cosmoslab/smarthome/walnut/#      # no wildcards at all
+```
+
+Every wildcard between the root and the isolation boundary is a place a mistake
+becomes a cross-account grant. Nothing is lost by putting the account first —
+fleet queries just move the wildcard:
+
+```
+cosmoslab/+/+/apollo/air1/#               every AIR-1, every account
+cosmoslab/+/+/apollo/#                    every Apollo device
+cosmoslab/+/+/chassisshield/aeroguard/#   every AeroGuard unit
+```
+
+> 🔴 **The segment order must be identical in every category.** Account-first
+> under `smarthome` but vendor-first under `industrial` would make
+> `cosmoslab/+/walnut/#` match a *vendor* slot as well as an account slot — a
+> customer sharing a name with a vendor would silently gain another tenant's
+> tree — and every topic-parsing function would have to branch on the category.
+
+### Two things this rule deliberately does not say
+
+- **The device id is a slug, not necessarily a room.**
+  `.../shelly/mini1pmg4/basement_bath_fan` is a fixture, because a basement
+  bathroom can hold both a fan and a sensor. Room-as-identity is the convention
+  for whole-room sensors only.
+- **The model in segment 4 is a classification, not an identity.** The device is
+  still `living_room`, not `air1`. Putting the model in the identity slot was
   rejected: a homeowner thinks in rooms, not part numbers.
-- **Variable device-path depth is accepted on purpose.** The `aeroguard/` segment
-  is a product family, so a customer buying two product lines gets them separated
-  inside their own account.
 
-> ⚠️ **The subscriptions are where depth is baked in, and they are literal.**
-> Node-RED's home-device subscriptions are `+/+/state` and `+/+/config/home`,
-> which assume a home device is *exactly* depth 2; the AeroGuard ones are
-> `+/aeroguard/+/telemetry` and `+/aeroguard/+/status`, which hardcode the product
-> family. A device that does not fit either shape is **silently ignored** — no
-> error, no log line, nothing in InfluxDB. So the depth constraints above are
-> rules, not accidents: home devices are `<account>/<device>`, AeroGuard units are
-> `<account>/aeroguard/<device>`. Adding a shape means adding an `mqtt in` node
-> (one topic per node).
+> ⚠️ **Subscriptions are literal, and a device that does not fit is silently
+> ignored** — no error, no log line, nothing in InfluxDB. Node-RED subscribes
+> with `cosmoslab/+/+/+/+/+/state` and `.../config/home` for home devices, and
+> scopes the AeroGuard ones to `cosmoslab/+/+/chassisshield/aeroguard/+/telemetry`
+> and `.../status`. That family literal is deliberate: a blanket six-wildcard
+> `status` subscription would also match an AIR-1's own online/offline status and
+> feed foreign messages into a watchdog that is specifically about AeroGuard units.
+> Supporting a genuinely new shape means adding an `mqtt in` node — one topic per
+> node.
 
 ---
 
@@ -97,7 +124,8 @@ In `Integrations/ESPHome/apollo-air1-mqtt.yaml`:
 ```yaml
 substitutions:
   name: apollo-air-1                 # ESPHome node name; must be unique on the network
-  mqtt_topic: <account>/<device>     # ← the device's topic root, e.g. walnut/living_room
+  mqtt_topic: cosmoslab/<category>/<account>/<vendor>/<model>/<device>
+  #   e.g. cosmoslab/smarthome/walnut/apollo/air1/living_room
   mqtt_port: "8883"
 ```
 
@@ -109,17 +137,17 @@ with `python3 scripts/air1-ota.py --get mqtt_topic`.
 **`mqtt_topic` is the whole tenancy story.** Everything derives from it:
 
 ```
-<account>/<device>/state           combined JSON snapshot — the data path
-<account>/<device>/status          online/offline (birth + last will)
-<account>/<device>/config/home     retained account config — see §5
-<account>/<device>/command/ota     pull-OTA trigger
+cosmoslab/<category>/<account>/<vendor>/<model>/<device>/state         combined JSON snapshot — the data path
+cosmoslab/<category>/<account>/<vendor>/<model>/<device>/status        online/offline (birth + last will)
+cosmoslab/<category>/<account>/<vendor>/<model>/<device>/config/home   retained account config — see §5
+cosmoslab/<category>/<account>/<vendor>/<model>/<device>/command/ota   pull-OTA trigger
 ```
 
-Per the convention above, the **first segment is the account** and the **last
-segment before the channel is the device id**. Node-RED subscribes with wildcards
-in both slots (`+/+/state`) and derives both from the topic, so adding an account
-or a second device requires no flow changes — as long as the device path is one
-segment deep.
+Per the convention above, the **account is segment 2** and the **device is
+segment 5**. Node-RED subscribes with wildcards in every slot between them
+(`cosmoslab/+/+/+/+/+/state`) and derives both by absolute index, so adding an
+account, a vendor, a model or another device requires no flow changes — as long
+as the topic is exactly six segments before the channel.
 
 ---
 
@@ -144,35 +172,26 @@ mosquitto_passwd -b /path/to/password.txt <account>_<device> '<password>'
 cat >> /path/to/acl.conf <<'EOF'
 
 user <account>_<device>
-topic readwrite <account>/<device>/#
+topic readwrite cosmoslab/<category>/<account>/<vendor>/<model>/<device>/#
 EOF
 
 docker kill -s HUP mosquitto
 ```
 
-> 🔴 **That is one of TWO lines you need, and the second one is easy to miss.**
-> The ingestion hub account `nodered` does **not** hold a bare `#` — it holds each
-> account root explicitly (`cosmoslab/#` and `walnut/#` today). A brand-new
-> `acme/` root is therefore **invisible to Node-RED** until a second grant is
-> added under `user nodered`:
+> ✅ **It is ONE line. It used to be two, and that trap is now gone.**
 >
-> ```
-> user nodered
-> topic readwrite acme/#
-> ```
+> The ingestion hub account `nodered` holds a single grant, `cosmoslab/#`, which
+> covers the entire tree forever. Before the six-segment scheme each account had
+> its own root (`walnut/#`, `acme/#`, …) and `nodered` needed a second, separate
+> grant on every new one — which was easy to forget and **failed in total
+> silence**, because a denied SUBSCRIBE is not logged at any level and a denied
+> PUBLISH only at `debug`. Putting every account under `cosmoslab/` removed the
+> failure mode rather than documenting it.
 >
-> The failure is completely silent: a denied SUBSCRIBE is not logged at any
-> level, and a denied PUBLISH is logged at `debug` only, which is off. Adding a
-> device to an account root that already exists needs only the first line.
-
-> **A denied publish is silent.** At QoS 0 the client is told nothing, and
-> Mosquitto logs ACL denials at **`debug` level only** — so a wrong topic rule
-> makes data vanish with no evidence anywhere. Add `log_type debug` temporarily
-> while editing ACLs, confirm you see `Denied PUBLISH` for something that should
-> fail, then remove it (debug is ~25k lines/hour).
->
-> Also: **`log_type` takes one value per line.** `log_type error warning notice
-> information` looks right and silently applies only `error`.
+> Still true and still worth knowing: **a denied publish is silent at QoS 0.**
+> Verify a new device by InfluxDB row counts, never by a dashboard, which renders
+> its last good value indefinitely. Turn on `log_type debug` while editing ACLs
+> and take it back off afterwards — that is the only level denials appear at.
 
 ---
 
@@ -183,12 +202,12 @@ its own readings flow, but every **outdoor** provider (AirNow, OpenWeatherMap,
 Google Air Quality, PurpleAir) is polled per account and needs the account's
 location.
 
-Publish a **retained** JSON message to `<account>/<device>/config/home`:
+Publish a **retained** JSON message to `<…>/<device>/config/home`:
 
 ```bash
 mosquitto_pub -h <broker> -p 8883 --capath /etc/ssl/certs \
   -u <account>_<device> -P '<password>' -r \
-  -t '<account>/<device>/config/home' -m '{
+  -t 'cosmoslab/<category>/<account>/<vendor>/<model>/<device>/config/home' -m '{
     "lat": 42.583,
     "lon": -83.365,
     "zip": "48324",
@@ -217,7 +236,7 @@ are shared across tenants unless a per-tenant key is set in the registry entry.
 ## 6. Verify
 
 1. `just logs` — MQTT connected, a `state` publish each cycle.
-2. Broker: `mosquitto_sub -h <broker> -p <port> -u <account>_<device> -P '<pw>' -t '<account>/<device>/state' -v`
+2. Broker: `mosquitto_sub -h <broker> -p <port> -u <account>_<device> -P '<pw>' -t 'cosmoslab/<category>/<account>/<vendor>/<model>/<device>/state' -v`
    shows one JSON snapshot. **Pass the connection flags explicitly.** Do not keep
    them in a `~/.config/mosquitto_sub` defaults file: mosquitto's clients read
    that file implicitly, it stores the password in plaintext, and it goes stale
@@ -249,9 +268,8 @@ Uptime Kuma monitor on `:1880`).
 
 No flow changes, no cloned tabs:
 
-1. Broker account + **two** ACL lines (§4) — the account's own `user`/`topic`
-   pair, **and** a grant on the new root under `user nodered`. It is not one
-   line, and omitting the second fails silently.
+1. Broker account + **one** ACL line (§4): the account's own `user`/`topic`
+   pair. `nodered` already holds `cosmoslab/#` and needs nothing added.
 2. `mqtt_topic: <their-account>/<their-device>` in their unit's substitutions,
    then flash.
 3. Publish their retained `config/home` (§5).
@@ -266,7 +284,7 @@ just ota          # bump patch, build, publish, trigger over MQTT
 just check        # compare device version vs repo, without pushing
 ```
 
-OTA is a **pull**: you publish a firmware URL to `<account>/<device>/command/ota`
+OTA is a **pull**: you publish a firmware URL to `<…>/<device>/command/ota`
 and the device fetches it itself, so it works for units behind a VLAN or anywhere
 mDNS does not reach — no IP or hostname needed.
 
