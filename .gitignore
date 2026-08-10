@@ -45,4 +45,5 @@ __pycache__/
 # ESPHome writes a fully-expanded copy of the config -- OTA password in
 # plaintext -- to .esphome/storage/*.validated.yaml on every build.
 secrets.yaml
+secrets.yaml.bak-*
 .esphome/
