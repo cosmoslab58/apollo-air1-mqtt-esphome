@@ -27,16 +27,15 @@
 #     default). On USB power the device stays awake and streams points; on
 #     battery (prevent_sleep off) it reverts to one publish per deep-sleep wake.
 #     See apollo-air1-mqtt-README.md.
-#   - Adaptive publish cadence: that interval is not a flat 60s. While the worst
-#     severity band across PM AQI, CO2, VOC and NOx is at `publish_elevated_band`
-#     or above it publishes every `publish_period_elevated_s` instead of
-#     `publish_period_s`, and a band CHANGE publishes within a second at either
-#     rate — so a dashboard refreshed just after the LED changes colour shows the
-#     reading that caused it. Driven by air_band_worst, deliberately not by the
-#     LED, so turning the LED down or off does not slow the data down.
+#   - FIXED publish cadence: that interval is a flat `publish_period_s`. It was
+#     adaptive (60s green / 15s elevated, plus a band-change jump) until
+#     1.3.15-mqtt; that is gone. A rate that varies with the reading biases every
+#     statistic taken over the raw series toward bad air, and a live display and
+#     a historical record want opposite things anyway. The device now publishes
+#     fast and uniformly; Node-RED decimates on the way into InfluxDB.
 #   - One band table, exported. The `band_cuts_*` globals are the only definition
-#     of severity in the system: they grade the readings, set the cadence, and
-#     pick the LED colour. `publish_band_config` publishes them to
+#     of severity in the system: they grade the readings and pick the LED colour.
+#     (They no longer set the cadence.) `publish_band_config` publishes them to
 #     `${mqtt_topic}/config/bands` (retained) so the dashboard colours its UI
 #     from the device's numbers instead of its own — the two had genuinely
 #     drifted (CO2 banded at 1000/1500/2000 in the app vs 800/1100/2000/3500/5000
@@ -85,7 +84,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.3.14-mqtt"
+  version: "1.3.15-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -98,63 +97,43 @@ substitutions:
 
   # --- Publish cadence (continuous / USB mode only) --------------------------
   # How often the combined ${mqtt_topic}/state snapshot goes out while
-  # prevent_sleep is on. Two rates, because a dashboard is only worth keeping
-  # fresh when something is actually moving:
+  # prevent_sleep is on. ONE fixed rate. There is no elevated rate and no
+  # band-change trigger; both were removed in 1.3.15-mqtt.
   #
-  #   publish_period_s           below publish_elevated_band, or nothing read yet
-  #   publish_period_elevated_s  worst band >= publish_elevated_band (1 = above green)
+  # Why fixed. The old scheme published every 60s at band 0 and every 15s above
+  # it. That makes the sample rate a function of the thing being measured, which
+  # biases every unweighted statistic over the raw series toward bad air: with
+  # the air elevated 25% of the day, those periods contribute 57% of the samples
+  # (4f/(3f+1)). Nothing downstream corrected for it, and nothing flagged it.
   #
-  # publish_elevated_band is 1 -- "anything above green" -- and that is only
-  # honest because band 0 now means what it says. It is worth understanding why
-  # this setting exists at all, because it is coupled to the VOC table.
+  # It also conflated two jobs with opposite requirements. A display wants low
+  # latency and does not care about durability; a historical record wants a
+  # uniform cadence and does not care about latency. Publishing fast and
+  # uniformly serves the first, and Node-RED decimating to a slow fixed rate on
+  # the way into InfluxDB serves the second. Neither has to compromise, and the
+  # stored series is finally safe to take a mean over.
   #
-  # With the VOC first cut at the 80 this config inherited from upstream, band
-  # >= 1 was true 50.5% of the time on real data, and 94% of that was VOC idling
-  # at its own baseline -- a permanent 2.5x rise in recording rate signalling
-  # nothing. The fix at the time was to raise this threshold to 2, which worked
-  # but treated the symptom. Retuning band_cuts_voc to start at 150 fixed the
-  # cause, and band >= 1 is now true 5.3% of the time (1.16x the points/day of a
-  # flat 60s), so the plain reading of "above green" is usable again.
+  # 5s is the sensor floor, not an arbitrary pick: the SCD40 in periodic mode
+  # produces a new measurement every ~5s internally, the SEN55 every ~1s. Below
+  # 5s consecutive snapshots would just repeat a cached CO2 reading. At exactly
+  # 5s a few consecutive values will still repeat, which is fine for a live
+  # readout and irrelevant to the log, which is decimated anyway.
   #
-  # If you retune band_cuts_voc back down, revisit this number too -- measure the
-  # fraction of time spent above the threshold before trusting it.
+  # This does NOT set how fast the LED reacts. led_evaluate runs from each
+  # sensor's own on_value, so the light tracks the SCD40's ~5s internal cadence
+  # whatever this is set to -- breathe on the unit and it responds even if this
+  # were 600s.
   #
-  # The band-CHANGE publish below is independent of this: crossing ANY boundary
-  # publishes within a second, so you never miss the moment the LED changes
-  # colour even if the threshold is set high. This governs only whether the fast
-  # STEADY rate is held afterwards.
-  #
-  # "Worst band" is the same 0-5 severity used to colour the LED, taken across
-  # PM AQI, CO2, VOC and NOx -- but read from air_band_worst, NOT from the LED.
-  # The two are deliberately decoupled: LED Brightness 0 or Air Quality LED
-  # Source "Off" means a dark LED, not stale data.
-  #
-  # A band CHANGE also publishes immediately at either rate, so the first
-  # snapshot showing the new colour lands within a second of the LED changing
-  # instead of up to a full period later. That is the case someone refreshing
-  # the page is usually trying to catch.
-  #
-  # Set the two equal for one fixed rate (upstream's behaviour).
-  #
-  # DON'T GO FASTER THAN THE SENSORS. The useful floor is ~5s, set by the SCD40:
-  # in periodic mode it produces a new measurement every ~5s internally, and the
-  # SEN55 every ~1s. (Those are the real limits, not the 10s `update_interval`s
-  # in this file -- reportAllValues force-updates every component before it
-  # serialises, so a publish always triggers a fresh read regardless of the
-  # configured polling interval.) Below ~5s consecutive snapshots would start
-  # repeating the same CO2 reading: more rows in InfluxDB, no more information.
-  # 15s is ~3x that floor, so every elevated publish carries genuinely new data
-  # on every channel.
-  #
-  # The 1s tick of the interval below is a hard floor too, but it is scheduler
-  # granularity and reads no sensors -- see the comment there.
+  # 🔴 Raising the rate raises I2C load. reportAllValues force-updates every
+  # component before it serialises, so this is also the rate at which all three
+  # sensors get polled. They share one bus (bus_a) and it already fails ~39% of
+  # reads, recovering on the next poll. If the scd4x/sen5x "set Warning flag"
+  # flapping gets worse after a change here, back this off to 10s before
+  # suspecting the sensors.
   #
   # None of this applies in battery/deep-sleep mode (prevent_sleep off): the
-  # device is asleep for most of the cycle and publishes once per wake. See
-  # "Publish cadence" in the README.
-  publish_period_s: "60"
-  publish_period_elevated_s: "15"
-  publish_elevated_band: "1"
+  # device is asleep for most of the cycle and publishes once per wake.
+  publish_period_s: "5"
 
   # --- Air danger alarm ------------------------------------------------------
   # Thresholds at which the RGB LED strobes through colors as a get-out-of-the-
@@ -737,20 +716,14 @@ globals:
     type: int
     initial_value: "-1"
 
-  # Publish-cadence bookkeeping for the interval below. publish_last_band starts
-  # at -1 to match air_band_worst's own "nothing read yet" value, so the first
-  # real reading registers as a change (-1 -> whatever the air is) and gets a
-  # point out promptly instead of waiting a full period behind the on_connect
-  # publish. publish_last_ms is compared with unsigned arithmetic, which is
-  # rollover-safe at the ~49 day millis() wrap.
+  # Publish-cadence bookkeeping for the interval below. Compared with unsigned
+  # arithmetic, which is rollover-safe at the ~49 day millis() wrap.
+  # (publish_last_band lived here until 1.3.15-mqtt, to spot a band change and
+  # jump the publish queue. With a fixed 5s cadence there is nothing to jump.)
   - id: publish_last_ms
     restore_value: no
     type: uint32_t
     initial_value: "0"
-  - id: publish_last_band
-    restore_value: no
-    type: int
-    initial_value: "-1"
 
 i2c:
   sda: GPIO1
@@ -769,13 +742,11 @@ deep_sleep:
 # (prevent_sleep off) this stays quiet and the on_connect publish + deep sleep
 # handles the one-point-per-wake cadence.
 #
-# The rate is adaptive rather than a flat 60s -- see the publish_period_*
-# substitutions at the top for the rationale and the knobs. The 1s tick is
-# scheduler granularity, not the publish rate: the lambda decides whether
-# anything is actually due, and on a green, steady device it declines 59 times
-# out of 60. Setting the tick to the slow rate instead would quantise
-# everything to it, so a band change could sit unpublished for up to a minute --
-# precisely the wait this exists to remove.
+# The rate is a flat ${publish_period_s} -- see the substitution at the top.
+# The 1s tick is scheduler granularity, not the publish rate: the lambda decides
+# whether anything is actually due. Kept at 1s rather than raised to the publish
+# period so the two stay independent; at a 5s period it simply declines 4 ticks
+# out of 5, which costs nothing.
 interval:
   - interval: 1s
     then:
@@ -784,23 +755,8 @@ interval:
             return;
           }
 
-          // During an event, publish faster: someone opening the dashboard
-          // wants to watch it move, and a minute-old snapshot of an event in
-          // progress is stale enough to mislead about the trend. See
-          // publish_elevated_band at the top -- it is coupled to the VOC band
-          // table, and "above green" is only a sane trigger because band 0 has
-          // been retuned to actually mean normal.
-          const int band = id(air_band_worst);
-          const uint32_t period =
-              (band >= ${publish_elevated_band} ? ${publish_period_elevated_s}
-                                               : ${publish_period_s}) * 1000UL;
-
-          // A band change jumps the queue. This cannot become a publish storm
-          // even if a reading sits on a boundary and dithers across it: bands
-          // only move when a sensor reports, and the fastest of those is 10s.
           const uint32_t now = millis();
-          const bool changed = (band != id(publish_last_band));
-          if (!changed && (now - id(publish_last_ms)) < period) {
+          if ((now - id(publish_last_ms)) < ${publish_period_s} * 1000UL) {
             return;
           }
 
@@ -808,9 +764,9 @@ interval:
           // measured from a fixed point. reportAllValues takes ~500ms (it
           // force-updates every component and waits for them before
           // serialising); charging that to the interval would make the real
-          // cadence drift slower than the configured one.
+          // cadence drift slower than the configured one. At a 5s period that
+          // is a ~10% duty cycle -- the reason not to go below 5s.
           id(publish_last_ms) = now;
-          id(publish_last_band) = band;
           id(reportAllValues).execute();
 
   # Day/night LED ramp. Unconditional -- unlike the publish tick above it is not
@@ -1949,9 +1905,12 @@ script:
             colors.add("#e00000");  // 3
             colors.add("#9900ff");  // 4
             colors.add("#600000");  // 5 -- LED shows dimmed red, not a new hue
-            root["elevated_band"] = ${publish_elevated_band};
+            // period_s only. elevated_band and period_elevated_s were removed
+            // in 1.3.15-mqtt when the cadence became fixed; a consumer still
+            // looking for them should read their absence as "the rate never
+            // varies". Note this is the MQTT publish rate, NOT the rate at
+            // which points reach InfluxDB -- Node-RED decimates downstream.
             root["period_s"] = ${publish_period_s};
-            root["period_elevated_s"] = ${publish_period_elevated_s};
             root["firmware_version"] = "${version}";
 
   # Stock behaviour, ported from upstream Core.yaml. Paints rgb_light with the

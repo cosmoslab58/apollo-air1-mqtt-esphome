@@ -254,9 +254,14 @@ A tenant that appears in the fan-out but not in the config ingress means the
 ## 7. Monitoring
 
 The flow already runs a **per-tenant freshness watchdog**: the AIR-1 publishes
-every 60 s (15 s when its air band is elevated), so five minutes of silence
-raises a Gotify alert, and recovery clears it. It is edge-triggered, so a unit
-that stays down does not repeat.
+every 5 s (a flat rate since 1.3.15-mqtt — it was 60 s, or 15 s when the air
+band was elevated), so five minutes of silence raises a Gotify alert, and
+recovery clears it. It is edge-triggered, so a unit that stays down does not
+repeat.
+
+Note the watchdog watches **MQTT**, not InfluxDB. Node-RED decimates to a slower
+fixed rate on the way into the database, so the stored cadence is deliberately
+not the published one — do not retune this threshold against what InfluxDB shows.
 
 Its blind spot is deliberate and worth knowing: it runs *inside* Node-RED, so it
 cannot report Node-RED itself being down. That needs an external check (an
