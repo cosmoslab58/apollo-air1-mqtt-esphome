@@ -85,7 +85,7 @@
 substitutions:
   name: apollo-air-1
   friendly_name: "Apollo AIR-1"
-  version: "1.3.13-mqtt"
+  version: "1.3.14-mqtt"
   # Root of this device's MQTT topic tree. Everything else is derived from it:
   #   ${mqtt_topic}/state              combined JSON snapshot (the data path)
   #   ${mqtt_topic}/status             online/offline (birth + LWT)
@@ -419,6 +419,34 @@ mqtt:
   certificate_authority: !secret mqtt_ca_cert
   topic_prefix: ${mqtt_topic}
   discovery: false
+  # Console log stream, DISABLED. Empty means off -- the mqtt component tests
+  # `if not log_topic` and simply never installs the log callback, so this
+  # costs nothing at runtime rather than publishing to a topic nobody reads.
+  #
+  # Left at the default it publishes every logger line to ${mqtt_topic}/debug,
+  # and that made the busiest topic in the whole estate a log stream: measured
+  # 2026-08-10 at one message every 3.8s, more than any actual sensor, running
+  # 24/7. None of it was telemetry -- over a 5 minute sample, 50 of 80 lines
+  # were scd4x's "Ambient pressure compensation skipped; no change required"
+  # (an ESP_LOGD that fires on every poll that does NOT change anything), 20
+  # were the SCD40 I2C warning flag setting and clearing, and 10 were the LED
+  # ambience frame-rate counter. Nothing subscribes to it; Node-RED reads the
+  # combined ${mqtt_topic}/state snapshot, and InfluxDB never saw any of it.
+  #
+  # This does NOT make the device quieter to debug. `just logs` is exactly
+  # `air1-ota.py --subscribe debug`, so it stops returning anything while this
+  # is off -- that is the trade, and it is the only recipe this breaks.
+  # The alternatives, in order of preference when you actually need logs:
+  #   - `just monitor` -- the serial console, on the bench over USB;
+  #   - the web_server on port 80, which has its own log view;
+  #   - re-enable this TEMPORARILY at a level that is not a firehose:
+  #       log_topic:
+  #         topic: ${mqtt_topic}/debug
+  #         level: WARN
+  #     WARN still carries the scd4x flag flapping (it is an ESP_LOGW) but
+  #     drops the ESP_LOGD pressure and frame-rate spam, which was 75% of it.
+  # Restore the full stream only for as long as you are watching it.
+  log_topic:
   # Pull-OTA trigger. Publish (NOT retained -- see below):
   #   {"command":"ota","url":"https://host/path/firmware.ota.bin","version":"1.2.0"}
   # to ${mqtt_topic}/command/ota. The device fetches the image itself, so the
