@@ -13,7 +13,10 @@ file and say "go".
 
 Flow:
   1. copy firmware.ota.bin (+ an .md5 sidecar) into the static web root,
-     under a version-stamped filename so the URL is unique per build
+     under a version-stamped filename with a random suffix. The web root is
+     reachable from the internet and the image carries the WiFi and broker
+     credentials, so the name is unguessable and both files are deleted
+     when the run ends, however it ends
   2. preflight the URL for a direct 200 and matching Content-Length
   3. publish {"command":"ota","url":...,"version":...} to <topic>/command/ota
   4. wait for the device to reboot and report the new version back over MQTT
@@ -36,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import ssl
 import sys
@@ -212,8 +216,10 @@ def wait_for_confirm(args, expected, timeout):
             print(f"confirm  : device is up on {v} ✓")
             return True
         time.sleep(5)
-    print("confirm  : no confirmation in the window — the device may still be "
-          "downloading. Re-check with `just check`.")
+    print("confirm  : no confirmation in the window. The image is removed from the "
+          "web root on exit, so a download still in progress will fail and the "
+          "device keeps its current firmware (it verifies before switching). "
+          "Re-check with `just check`, and re-run with a longer --timeout if needed.")
     return False
 
 
@@ -221,9 +227,10 @@ def wait_for_confirm(args, expected, timeout):
 #  Publish
 # --------------------------------------------------------------------------- #
 def publish_file(binpath, publish_dir, version):
-    """Copy the image + an .md5 sidecar into the web root under a versioned name."""
+    """Copy the image + an .md5 sidecar into the web root under a versioned,
+    unguessable name. The caller deletes both (unpublish) when it is done."""
     os.makedirs(publish_dir, exist_ok=True)
-    name = f"apollo-air-1-{version}.ota.bin"
+    name = f"apollo-air-1-{version}-{secrets.token_urlsafe(16)}.ota.bin"
     dest = os.path.join(publish_dir, name)
     shutil.copy2(binpath, dest)
     os.chmod(dest, 0o644)
@@ -233,6 +240,15 @@ def publish_file(binpath, publish_dir, version):
         f.write(md5)
     os.chmod(dest + ".md5", 0o644)
     return name, md5
+
+
+def unpublish(publish_dir, name):
+    for path in (os.path.join(publish_dir, name), os.path.join(publish_dir, name) + ".md5"):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    print(f"removed  : {name} (+ .md5) from the web root")
 
 
 def check_url(url):
@@ -342,39 +358,42 @@ def main():
     size = os.path.getsize(args.bin)
 
     name, md5 = publish_file(args.bin, args.publish_dir, repo_version)
-    url = f"{args.base_url.rstrip('/')}/{name}"
-    print(f"firmware : {args.bin} ({size} bytes, md5 {md5})")
-    print(f"published: {os.path.join(args.publish_dir, name)}")
-    print(f"url      : {url}")
-
-    status, clen, loc = check_url(url)
-    if status is None:
-        sys.exit("url check: the firmware URL is unreachable from here — if the device "
-                 "can't fetch it either, the OTA would fail mid-flight. Check the web "
-                 "host, or pass --base-url.")
-    if status != 200:
-        extra = f" -> redirects to {loc}" if loc else ""
-        sys.exit(f"url check: HTTP {status}{extra}. The device needs a direct 200 "
-                 f"at this URL; fix the web root or pass --base-url.")
-    if clen is not None and clen != size:
-        sys.exit(f"url check: served {clen} bytes but the file is {size} (stale copy?)")
-    print(f"url check: HTTP 200, {clen if clen is not None else '?'} bytes ✓")
-
-    if args.dry_run:
-        print("dry-run  : not triggering. Payload would be:")
-        print("           " + json.dumps({"command": "ota", "url": url, "version": repo_version}))
-        return
-
     try:
-        current = read_device_version(args)
-        if current == repo_version:
-            print(f"note     : device already reports {current}; it will skip the flash.")
-    except Exception:
-        pass
+        url = f"{args.base_url.rstrip('/')}/{name}"
+        print(f"firmware : {args.bin} ({size} bytes, md5 {md5})")
+        print(f"published: {os.path.join(args.publish_dir, name)}")
+        print(f"url      : {url}")
 
-    trigger(args, url, repo_version)
-    wait_for_confirm(args, repo_version, args.timeout)
-    print("done.")
+        status, clen, loc = check_url(url)
+        if status is None:
+            sys.exit("url check: the firmware URL is unreachable from here — if the device "
+                     "can't fetch it either, the OTA would fail mid-flight. Check the web "
+                     "host, or pass --base-url.")
+        if status != 200:
+            extra = f" -> redirects to {loc}" if loc else ""
+            sys.exit(f"url check: HTTP {status}{extra}. The device needs a direct 200 "
+                     f"at this URL; fix the web root or pass --base-url.")
+        if clen is not None and clen != size:
+            sys.exit(f"url check: served {clen} bytes but the file is {size} (stale copy?)")
+        print(f"url check: HTTP 200, {clen if clen is not None else '?'} bytes ✓")
+
+        if args.dry_run:
+            print("dry-run  : not triggering. Payload would be:")
+            print("           " + json.dumps({"command": "ota", "url": url, "version": repo_version}))
+            return
+
+        try:
+            current = read_device_version(args)
+            if current == repo_version:
+                print(f"note     : device already reports {current}; it will skip the flash.")
+        except Exception:
+            pass
+
+        trigger(args, url, repo_version)
+        wait_for_confirm(args, repo_version, args.timeout)
+        print("done.")
+    finally:
+        unpublish(args.publish_dir, name)
 
 
 if __name__ == "__main__":
