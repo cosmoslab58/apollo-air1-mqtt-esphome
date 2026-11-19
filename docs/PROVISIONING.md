@@ -83,14 +83,15 @@ cosmoslab/+/+/chassisshield/aeroguard/#   every AeroGuard unit
   rejected: a homeowner thinks in rooms, not part numbers.
 
 > ⚠️ **Subscriptions are literal, and a device that does not fit is silently
-> ignored** — no error, no log line, nothing in InfluxDB. Node-RED subscribes
-> with `cosmoslab/+/+/+/+/+/state` and `.../config/home` for home devices, and
-> scopes the AeroGuard ones to `cosmoslab/+/+/chassisshield/aeroguard/+/telemetry`
+> ignored**: no error, no log line, nothing in InfluxDB. automation subscribes
+> with `cosmoslab/+/+/+/+/+/state` and `.../config/home` for home devices (its
+> air1 tab), and scopes the AeroGuard ones (its aeroguard tab) to `cosmoslab/+/+/chassisshield/aeroguard/+/telemetry`
 > and `.../status`. That family literal is deliberate: a blanket six-wildcard
 > `status` subscription would also match an AIR-1's own online/offline status and
 > feed foreign messages into a watchdog that is specifically about AeroGuard units.
-> Supporting a genuinely new shape means adding an `mqtt in` node — one topic per
-> node.
+> Supporting a genuinely new shape means adding a subscription to the tab
+> (`ctx.on_mqtt` in `automation/tabs/air1/__init__.py` or
+> `automation/tabs/aeroguard/__init__.py`), with its tests.
 
 ---
 
@@ -144,9 +145,9 @@ cosmoslab/<category>/<account>/<vendor>/<model>/<device>/command/ota   pull-OTA 
 ```
 
 Per the convention above, the **account is segment 2** and the **device is
-segment 5**. Node-RED subscribes with wildcards in every slot between them
-(`cosmoslab/+/+/+/+/+/state`) and derives both by absolute index, so adding an
-account, a vendor, a model or another device requires no flow changes — as long
+segment 5**. automation's air1 tab subscribes with wildcards in every slot
+between them (`cosmoslab/+/+/+/+/+/state`) and derives both by absolute index, so
+adding an account, a vendor, a model or another device requires no code changes, as long
 as the topic is exactly six segments before the channel.
 
 ---
@@ -180,10 +181,11 @@ docker kill -s HUP mosquitto
 
 > ✅ **It is ONE line. It used to be two, and that trap is now gone.**
 >
-> The ingestion hub account `nodered` holds a single grant, `cosmoslab/#`, which
-> covers the entire tree forever. Before the six-segment scheme each account had
-> its own root (`walnut/#`, `acme/#`, …) and `nodered` needed a second, separate
-> grant on every new one — which was easy to forget and **failed in total
+> The ingestion hub, automation (read-only `observer` broker account), subscribes
+> by wildcard across the `cosmoslab/` tree, so a new account needs nothing added
+> for it. Before the six-segment scheme each account had its
+> own root (`walnut/#`, `acme/#`, …) and the hub (Node-RED at the time) needed a
+> second, separate grant on every new one, which was easy to forget and **failed in total
 > silence**, because a denied SUBSCRIBE is not logged at any level and a denied
 > PUBLISH only at `debug`. Putting every account under `cosmoslab/` removed the
 > failure mode rather than documenting it.
@@ -223,13 +225,14 @@ mosquitto_pub -h <broker> -p 8883 --capath /etc/ssl/certs \
 | `location_slug` | InfluxDB `location` tag | falls back to `orchard_lake` |
 | `purpleair_sensor` | PurpleAir | falls back to sensor `178257`; set `null` to skip |
 
-**Retained matters.** Node-RED builds its tenant registry from this message on
-every reconnect; a non-retained publish registers the tenant until the next
-redeploy and then silently disappears.
+**Retained matters.** automation's air1 tab builds its tenant registry from this
+message on every broker connection and keeps it in its state file
+(`/data/state/air1.json`); a non-retained publish registers the tenant only until
+that state is reset, and then it silently disappears.
 
-API keys come from the Node-RED container's environment
-(`AIRNOW_API_KEY`, `OWM_API_KEY`, `GOOGLE_AQ_API_KEY`, `PURPLEAIR_API_KEY`) and
-are shared across tenants unless a per-tenant key is set in the registry entry.
+API keys come from automation's settings (`AIRNOW_API_KEY`, `OWM_API_KEY`,
+`GOOGLE_AQ_API_KEY`, `PURPLEAIR_API_KEY`, read in `automation/config.py`) and
+are shared across tenants.
 
 ---
 
@@ -241,40 +244,41 @@ are shared across tenants unless a per-tenant key is set in the registry entry.
    them in a `~/.config/mosquitto_sub` defaults file: mosquitto's clients read
    that file implicitly, it stores the password in plaintext, and it goes stale
    silently the moment the account is renamed or rotated.
-3. Node-RED: the *Fan out tenants* nodes report `N tenant(s)`, and *Tenant
-   Config Ingress* shows your tenant and its `location_slug`.
+3. automation: `just status` in `~/projects/automation` shows the air1 tab with
+   no errors, and its registry (flow `tenants` in `/data/state/air1.json`) lists
+   your tenant and its `location_slug`.
 4. InfluxDB: `air_quality` measurement carries `tenant` **and** `device_id`
    tags.
 
-A tenant that appears in the fan-out but not in the config ingress means the
+A tenant whose readings arrive but that is missing from the registry means the
 `config/home` message was not retained.
 
 ---
 
 ## 7. Monitoring
 
-The flow already runs a **per-tenant freshness watchdog**: the AIR-1 publishes
+automation's air1 tab already runs a **per-tenant freshness watchdog**: the AIR-1 publishes
 every 5 s (a flat rate since 1.3.15-mqtt — it was 60 s, or 15 s when the air
-band was elevated), so five minutes of silence raises a Gotify alert, and
+band was elevated), so five minutes of silence raises a push alert, and
 recovery clears it. It is edge-triggered, so a unit that stays down does not
 repeat.
 
-Note the watchdog watches **MQTT**, not InfluxDB. Node-RED decimates to a slower
+Note the watchdog watches **MQTT**, not InfluxDB. automation decimates to a slower
 fixed rate on the way into the database, so the stored cadence is deliberately
 not the published one — do not retune this threshold against what InfluxDB shows.
 
-Its blind spot is deliberate and worth knowing: it runs *inside* Node-RED, so it
-cannot report Node-RED itself being down. That needs an external check (an
-Uptime Kuma monitor on `:1880`).
+Its blind spot is deliberate and worth knowing: it runs *inside* automation, so
+it cannot report automation itself being down. That needs an external check
+(selfcheck reads automation's per-tab health status).
 
 ---
 
 ## 8. Adding a second account
 
-No flow changes, no cloned tabs:
+No code changes, no cloned tabs:
 
 1. Broker account + **one** ACL line (§4): the account's own `user`/`topic`
-   pair. `nodered` already holds `cosmoslab/#` and needs nothing added.
+   pair. automation subscribes by wildcard and needs nothing added.
 2. `mqtt_topic: <their-account>/<their-device>` in their unit's substitutions,
    then flash.
 3. Publish their retained `config/home` (§5).

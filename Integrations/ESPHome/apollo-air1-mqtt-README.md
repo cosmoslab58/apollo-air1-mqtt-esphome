@@ -425,7 +425,7 @@ bright is the safe direction: an LED dark at noon looks like a dead device,
 while an LED bright at midnight is just the old behaviour.
 
 Coordinates come from the retained `${mqtt_topic}/config/home` message the
-dashboard app publishes (the same one Node-RED reads for its outdoor polling),
+dashboard app publishes (the same one automation's air1 tab reads for its outdoor polling),
 falling back to the `home_latitude` / `home_longitude` substitutions until it
 arrives. Location is configured once, in the app, and every consumer follows.
 
@@ -690,7 +690,7 @@ disabled channel costs nothing.
 These sit deliberately high. 1000–2000 ppm CO2 is stuffy and measurably hurts
 concentration, but it is not dangerous, and an alarm that fires every afternoon
 in a closed office is one you stop seeing. The softer "you should ventilate"
-tier is already handled by the Node-RED Gotify alert at 1000 ppm / AQI 100 —
+tier is already handled by automation's air1 tab push alert at 1000 ppm / AQI 100:
 this is the tier above that, meant to read as *leave the room*.
 
 Notes and caveats:

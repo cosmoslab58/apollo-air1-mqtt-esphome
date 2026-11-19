@@ -32,7 +32,7 @@
 #     1.3.15-mqtt; that is gone. A rate that varies with the reading biases every
 #     statistic taken over the raw series toward bad air, and a live display and
 #     a historical record want opposite things anyway. The device now publishes
-#     fast and uniformly; Node-RED decimates on the way into InfluxDB.
+#     fast and uniformly; automation decimates on the way into InfluxDB.
 #   - One band table, exported. The `band_cuts_*` globals are the only definition
 #     of severity in the system: they grade the readings and pick the LED colour.
 #     (They no longer set the cadence.) `publish_band_config` publishes them to
@@ -109,7 +109,7 @@ substitutions:
   # It also conflated two jobs with opposite requirements. A display wants low
   # latency and does not care about durability; a historical record wants a
   # uniform cadence and does not care about latency. Publishing fast and
-  # uniformly serves the first, and Node-RED decimating to a slow fixed rate on
+  # uniformly serves the first, and automation decimating to a slow fixed rate on
   # the way into InfluxDB serves the second. Neither has to compromise, and the
   # stored series is finally safe to take a mean over.
   #
@@ -139,7 +139,7 @@ substitutions:
   # Thresholds at which the RGB LED strobes through colors as a get-out-of-the-
   # room signal. These are deliberately set at genuinely HARMFUL levels, not
   # merely "poor air" ones -- an alarm that cries wolf at a stuffy 1200ppm gets
-  # ignored when it matters. Node-RED already sends a Gotify nudge at the softer
+  # ignored when it matters. automation already sends a push nudge at the softer
   # 1000ppm / AQI 100 marks; this is the tier above that.
   #
   #   co2   5000 ppm : the ACGIH TLV / OSHA PEL 8-hour occupational limit.
@@ -409,7 +409,7 @@ mqtt:
   # were scd4x's "Ambient pressure compensation skipped; no change required"
   # (an ESP_LOGD that fires on every poll that does NOT change anything), 20
   # were the SCD40 I2C warning flag setting and clearing, and 10 were the LED
-  # ambience frame-rate counter. Nothing subscribes to it; Node-RED reads the
+  # ambience frame-rate counter. Nothing subscribes to it; automation reads the
   # combined ${mqtt_topic}/state snapshot, and InfluxDB never saw any of it.
   #
   # This does NOT make the device quieter to debug. `just logs` is exactly
@@ -461,14 +461,14 @@ mqtt:
     # Home location, for the sun calculation behind the day/night LED ramp.
     # Published RETAINED by the dashboard app (home_config.py) as
     #   {"zip":..., "lat":..., "lon":..., "location_slug":..., "purpleair_sensor":...}
-    # and consumed by Node-RED too, so the location is configured once, in the
+    # and consumed by automation too, so the location is configured once, in the
     # app, and every consumer follows. Retained means this lands within a second
     # of connecting rather than waiting for the next time someone saves a home.
     #
     # Unlike the OTA topic above, retention is exactly what this wants: replaying
     # it on every reconnect is idempotent (it sets two doubles).
     #
-    # Only the fields this device needs are read; the rest are Node-RED's. A
+    # Only the fields this device needs are read; the rest are automation's. A
     # missing or nonsensical payload leaves the compile-time fallback in place --
     # 0,0 is in the Gulf of Guinea, so it must be rejected rather than trusted.
     - topic: ${mqtt_topic}/config/home
@@ -588,7 +588,7 @@ globals:
   # ===========================================================================
   # THE BAND TABLES. This is the single source of truth for "how bad is it" on
   # this device, and there is deliberately no second copy anywhere -- not in
-  # another lambda, not in the dashboard, not in Node-RED. compute_air_bands
+  # another lambda, not in the dashboard, not in automation. compute_air_bands
   # grades readings against these, and publish_band_config publishes the very
   # same arrays to ${mqtt_topic}/config/bands (retained) so consumers colour
   # their UI from the device's numbers instead of their own. A dashboard showing
@@ -1100,7 +1100,7 @@ sensor:
     # every ~5s internally, so this reads real measurements rather than repeats
     # of a cached one.
     #
-    # This does NOT speed up data logging. Node-RED -> InfluxDB consumes the
+    # This does NOT speed up data logging. automation -> InfluxDB consumes the
     # combined ${mqtt_topic}/state snapshot, which reportAllValues publishes on
     # its own 60s interval and which force-updates every component first. The
     # only cost here is that this sensor's individual state topic now publishes
@@ -1909,7 +1909,7 @@ script:
             // in 1.3.15-mqtt when the cadence became fixed; a consumer still
             // looking for them should read their absence as "the rate never
             // varies". Note this is the MQTT publish rate, NOT the rate at
-            // which points reach InfluxDB -- Node-RED decimates downstream.
+            // which points reach InfluxDB -- automation decimates downstream.
             root["period_s"] = ${publish_period_s};
             root["firmware_version"] = "${version}";
 
